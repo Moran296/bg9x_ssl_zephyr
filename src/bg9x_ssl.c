@@ -25,8 +25,7 @@ LOG_MODULE_REGISTER(modem_quectel_bg9x_ssl, CONFIG_MODEM_LOG_LEVEL);
 #define CLIENT_KEY_FILE_NAME "cl_k_file"
 #define CME_ERR_FILE_DOES_NOT_EXIST "+CME ERROR: 405"
 
-#define CONFIG_MODEM_SSL_CELLULAR_APN "internet"
-#define CONFIG_MODEM_SSL_SECURITY_LEVEL "2"
+#define SECLEVEL STRINGIFY(CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL)
 
 struct bg9x_ssl_modem_config
 {
@@ -265,39 +264,25 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_init_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG=1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CPIN?", cpin_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QICSGP=1,1,\"" CONFIG_MODEM_SSL_CELLULAR_APN "\",\"\",\"\",3", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QICSGP=1,1,\"" CONFIG_BG9X_MODEM_SSL_APN "\",\"\",\"\",3", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGPADDR=1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QIACT=1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"sslversion\",1,4", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"ciphersuite\",1,0xFFFF", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"negotiatetime\",1,300", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"ignorelocaltime\",1,1", ok_match), // TODO: check if 0 or 1
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"seclevel\",1," CONFIG_MODEM_SSL_SECURITY_LEVEL, ok_match),
-                              // should be used only if sec level > 1
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"seclevel\",1," SECLEVEL, ok_match),
+#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 0
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"cacert\",1,\"" CA_FILE_NAME "\"", ok_match),
-                              // should be used only if sec level is 2
+#endif
+#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 1
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"clientcert\",1,\"" CLIENT_CERT_FILE_NAME "\"", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"clientkey\",1,\"" CLIENT_KEY_FILE_NAME "\"", ok_match), );
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"clientkey\",1,\"" CLIENT_KEY_FILE_NAME "\"", ok_match),
+#endif
+);
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_init_chat_script, bg9x_ssl_init_chat_script_cmds,
                          abort_matches, modem_cellular_chat_callback_handler, 10);
-
-// static void pipe_event_handler(struct modem_pipe *pipe,
-//                                enum modem_pipe_event event,
-//                                void *user_data)
-// {
-//     // struct modem_cellular_data *data = (struct modem_cellular_data *)user_data;
-
-//     switch (event)
-//     {
-//     case MODEM_PIPE_EVENT_OPENED:
-//         LOG_INF("UART pipe opened");
-//         break;
-
-//     default:
-//         break;
-//     }
-// }
 
 static int modem_dns_resolve(struct bg9x_ssl_modem_data *data, const char *host_req, char *ip_resp)
 {
@@ -355,12 +340,16 @@ static int bg9x_ssl_modem_write_files(struct bg9x_ssl_modem_data *data)
 {
     int ret;
 
+#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 0
     ret = write_modem_file(data, CA_FILE_NAME, data->ca_cert, strlen(data->ca_cert));
     if (ret != 0)
     {
         LOG_ERR("Failed to write CA file: %d", ret);
         return ret;
     }
+#endif
+
+#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 1
     ret = write_modem_file(data, CLIENT_CERT_FILE_NAME, data->client_cert, strlen(data->client_cert));
     if (ret != 0)
     {
@@ -373,8 +362,9 @@ static int bg9x_ssl_modem_write_files(struct bg9x_ssl_modem_data *data)
         LOG_ERR("Failed to write client key file: %d", ret);
         return ret;
     }
+#endif
+    LOG_DBG("Files written successfully");
 
-    LOG_INF("Files written successfully");
     return 0;
 }
 

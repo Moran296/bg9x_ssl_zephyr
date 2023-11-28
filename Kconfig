@@ -1,0 +1,34 @@
+config BG9X_MODEM_SSL
+	bool "Support for bg9x modem with offloaded ssl sockets"
+    select MODEM
+	select MODEM_MODULES
+	select MODEM_CHAT
+	select MODEM_PIPE
+	select MODEM_BACKEND_UART
+    select PM_DEVICE
+	# depends on DT_HAS_QUECTEL_BG95_ENABLED
+	help
+	  This driver implements a modem driver for the BG9X
+	  with the SSL sockets offloaded to the modem.
+
+if BG9X_MODEM_SSL
+
+config BG9X_MODEM_SSL_APN
+	string "APN"
+	default "internet"
+
+config BG9X_MODEM_SSL_SECURITY_LEVEL
+    int "SSL security level"
+    default 2
+    help
+      The security level to use for the SSL connection.
+      refer to BG95 SSL application seclevel command for details.
+      0: No authentication
+      1: Manage server authentication
+      2: Manage server and client authentication if requested by the remote server
+
+endif # BG9X_MODEM_SSL
+
+menu "Zephyr Kernel"
+source "Kconfig.zephyr"
+endmenu
