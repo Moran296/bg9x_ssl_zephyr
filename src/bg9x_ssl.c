@@ -27,6 +27,12 @@ LOG_MODULE_REGISTER(modem_quectel_bg9x_ssl, CONFIG_MODEM_LOG_LEVEL);
 
 #define SECLEVEL STRINGIFY(CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL)
 
+enum bg9x_ssl_modem_events
+{
+    SCRIPT_FINISHED,
+    REGISTERED,
+};
+
 struct bg9x_ssl_modem_config
 {
     const struct device *uart;
@@ -59,6 +65,7 @@ struct bg9x_ssl_modem_data
     uint8_t registration_status_gprs;
     uint8_t registration_status_lte;
     struct k_sem script_sem;
+    struct k_sem registration_sem;
 
     // certs
     const char *ca_cert;
@@ -70,6 +77,53 @@ struct bg9x_ssl_modem_data
     // dns
     char *last_resolved_ip[sizeof("255.255.255.255")];
 };
+
+static int wait_on_modem_event(struct bg9x_ssl_modem_data *data,
+                               enum bg9x_ssl_modem_events event,
+                               k_timeout_t timeout)
+{
+    struct k_sem *sem = NULL;
+
+    switch (event)
+    {
+    case SCRIPT_FINISHED:
+        sem = &data->script_sem;
+        break;
+    case REGISTERED:
+        sem = &data->registration_sem;
+        break;
+
+    default:
+        return -EINVAL;
+    }
+
+    return k_sem_take(sem, timeout);
+}
+
+static void notify_modem_event(struct bg9x_ssl_modem_data *data,
+                               enum bg9x_ssl_modem_events event,
+                               int error)
+{
+    struct k_sem *sem = NULL;
+
+    switch (event)
+    {
+    case SCRIPT_FINISHED:
+        sem = &data->script_sem;
+        break;
+    case REGISTERED:
+        sem = &data->registration_sem;
+        break;
+
+    default:
+        return;
+    }
+
+    if (error != 0)
+        k_sem_reset(sem);
+    else
+        k_sem_give(sem);
+}
 
 static bool modem_cellular_is_registered(struct bg9x_ssl_modem_data *data)
 {
@@ -118,6 +172,7 @@ static void on_cxreg_match_cb(struct modem_chat *chat, char **argv, uint16_t arg
 
     if (modem_cellular_is_registered(data))
     {
+        notify_modem_event(data, REGISTERED, 0);
         LOG_INF("Modem registered");
     }
     else
@@ -214,17 +269,8 @@ static void modem_cellular_chat_callback_handler(struct modem_chat *chat,
                                                  void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
-
-    if (result == MODEM_CHAT_SCRIPT_RESULT_SUCCESS)
-    {
-        LOG_INF("Chat script succeeded");
-        k_sem_give(&data->script_sem);
-    }
-    else
-    {
-        LOG_INF("Chat script failed");
-        k_sem_reset(&data->script_sem);
-    }
+    int ret = result == MODEM_CHAT_SCRIPT_RESULT_SUCCESS ? 0 : -EIO;
+    notify_modem_event(data, SCRIPT_FINISHED, ret);
 }
 
 /* ~~~~~~~~~~~~~~~~~~~  UPLOAD FILE CHAT SCRIPT ~~~~~~~~~~~~~~~~~~~~~~ */
@@ -259,11 +305,11 @@ MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_resolve_dns_chat_script, bg9x_ssl_resolve_dns_
 
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_init_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CREG=1", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGREG=1", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG=1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CPIN?", cpin_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
+                              // MODEM_CHAT_SCRIPT_CMD_RESP("AT+CREG=1", ok_match), -> not needed?
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGREG=1", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG=1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QICSGP=1,1,\"" CONFIG_BG9X_MODEM_SSL_APN "\",\"\",\"\",3", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGPADDR=1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QIACT=1", ok_match),
@@ -302,7 +348,7 @@ static int modem_dns_resolve(struct bg9x_ssl_modem_data *data, const char *host_
         return ret;
     }
 
-    ret = k_sem_take(&data->script_sem, K_FOREVER);
+    ret = wait_on_modem_event(data, SCRIPT_FINISHED, K_FOREVER);
     if (ret < 0)
     {
         LOG_ERR("Resolve DNS failed");
@@ -338,7 +384,7 @@ static int write_modem_file(struct bg9x_ssl_modem_data *data, const char *name, 
     if (ret != 0)
         return ret;
 
-    ret = k_sem_take(&data->script_sem, K_FOREVER);
+    ret = wait_on_modem_event(data, SCRIPT_FINISHED, K_FOREVER);
     return ret;
 }
 
@@ -382,7 +428,22 @@ static int run_interface_init_script(struct bg9x_ssl_modem_data *data)
     if (ret != 0)
         return ret;
 
-    return k_sem_take(&data->script_sem, K_FOREVER);
+    // Timeout is defined in the script, so K_FOREVER is actually not in effect
+    ret = wait_on_modem_event(data, SCRIPT_FINISHED, K_FOREVER);
+    if (ret != 0)
+    {
+        LOG_ERR("Modem init script failed");
+        return ret;
+    }
+
+    ret = wait_on_modem_event(data, REGISTERED, K_SECONDS(20));
+    if (ret != 0)
+    {
+        LOG_ERR("Modem did not register in time");
+        return ret;
+    }
+
+    return ret;
 }
 
 int bg9x_ssl_modem_interface_start(struct bg9x_ssl_modem_data *data)
@@ -483,6 +544,7 @@ static int bg9x_ssl_init(const struct device *dev)
 
     gpio_pin_configure_dt(&config->power_gpio, GPIO_OUTPUT_INACTIVE);
     k_sem_init(&data->script_sem, 0, 1);
+    k_sem_init(&data->registration_sem, 0, 1);
 
     // init uart backend
     const struct modem_backend_uart_config uart_backend_config = {
