@@ -125,6 +125,25 @@ static void notify_modem_event(struct bg9x_ssl_modem_data *data,
         k_sem_give(sem);
 }
 
+static int modem_run_script_and_wait(struct bg9x_ssl_modem_data *data,
+                                     const struct modem_chat_script *script)
+{
+    int ret;
+
+    ret = modem_chat_script_run(&data->chat, script);
+    if (ret != 0)
+        return ret;
+
+    // K_FOREVER is not in effect, since timeout is defined in the script
+    ret = wait_on_modem_event(data, SCRIPT_FINISHED, K_FOREVER);
+    if (ret != 0)
+        LOG_ERR("script: %s failed with err %d", script->name, ret);
+    else
+        LOG_DBG("script: %s finished successfully", script->name);
+
+    return ret;
+}
+
 static bool modem_cellular_is_registered(struct bg9x_ssl_modem_data *data)
 {
     return (data->registration_status_gsm == 1) ||
@@ -310,6 +329,8 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_init_chat_script_cmds,
                               // MODEM_CHAT_SCRIPT_CMD_RESP("AT+CREG=1", ok_match), -> not needed?
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGREG=1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG=1", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGREG?", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG?", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QICSGP=1,1,\"" CONFIG_BG9X_MODEM_SSL_APN "\",\"\",\"\",3", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGPADDR=1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QIACT=1", ok_match),
@@ -341,19 +362,10 @@ static int modem_dns_resolve(struct bg9x_ssl_modem_data *data, const char *host_
     }
 
     snprintk(dns_resolve_cmd, sizeof(dns_resolve_cmd), "AT+QIDNSGIP=1,\"%s\"", host_req);
-    ret = modem_chat_script_run(&data->chat, &bg9x_ssl_resolve_dns_chat_script);
-    if (ret < 0)
-    {
-        LOG_ERR("Resolve DNS script failed");
-        return ret;
-    }
 
-    ret = wait_on_modem_event(data, SCRIPT_FINISHED, K_FOREVER);
+    ret = modem_run_script_and_wait(data, &bg9x_ssl_resolve_dns_chat_script);
     if (ret < 0)
-    {
-        LOG_ERR("Resolve DNS failed");
         return ret;
-    }
 
     if (data->last_resolved_ip[0] == 0)
     {
@@ -380,12 +392,7 @@ static int write_modem_file(struct bg9x_ssl_modem_data *data, const char *name, 
     data->file_to_upload = file;
     data->file_to_upload_size = size;
 
-    ret = modem_chat_script_run(&data->chat, &bg9x_ssl_upload_file_chat_script);
-    if (ret != 0)
-        return ret;
-
-    ret = wait_on_modem_event(data, SCRIPT_FINISHED, K_FOREVER);
-    return ret;
+    return modem_run_script_and_wait(data, &bg9x_ssl_upload_file_chat_script);
 }
 
 static int bg9x_ssl_modem_write_files(struct bg9x_ssl_modem_data *data)
@@ -424,17 +431,9 @@ static int run_interface_init_script(struct bg9x_ssl_modem_data *data)
 {
     int ret;
 
-    ret = modem_chat_script_run(&data->chat, &bg9x_ssl_init_chat_script);
+    ret = modem_run_script_and_wait(data, &bg9x_ssl_init_chat_script);
     if (ret != 0)
         return ret;
-
-    // Timeout is defined in the script, so K_FOREVER is actually not in effect
-    ret = wait_on_modem_event(data, SCRIPT_FINISHED, K_FOREVER);
-    if (ret != 0)
-    {
-        LOG_ERR("Modem init script failed");
-        return ret;
-    }
 
     ret = wait_on_modem_event(data, REGISTERED, K_SECONDS(20));
     if (ret != 0)
