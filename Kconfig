@@ -27,6 +27,35 @@ config BG9X_MODEM_SSL_SECURITY_LEVEL
       1: Manage server authentication
       2: Manage server and client authentication if requested by the remote server
 
+if BG9X_MODEM_SSL_SECURITY_LEVEL > 0
+
+config BG9X_MODEM_SSL_CA_CERT
+    string "CA certificate"
+    default ""
+    help
+      The CA certificate to use for the SSL connection.
+      refer to BG95 SSL application AT+QSSLCFG="cacert" command for details.
+
+endif
+
+if BG9X_MODEM_SSL_SECURITY_LEVEL > 1
+
+config BG9X_MODEM_SSL_CLIENT_CERT
+    string "client public key certificate"
+    default ""
+    help
+      The client public key certificate to use for the SSL connection.
+      refer to BG95 SSL application AT+QSSLCFG="clientcert" command for details.
+
+config BG9X_MODEM_SSL_CLIENT_KEY
+    string "client private key certificate"
+    default ""
+    help
+      The client private key to use for the SSL connection.
+      refer to BG95 SSL application AT+QSSLCFG="clientkey" command for details.
+
+endif
+
 endif # BG9X_MODEM_SSL
 
 menu "Zephyr Kernel"
