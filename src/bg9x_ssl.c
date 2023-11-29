@@ -288,9 +288,9 @@ static int modem_dns_resolve(struct bg9x_ssl_modem_data *data, const char *host_
 {
     int ret;
 
-    if (strlen(host_req) > sizeof(dns_resolve_cmd))
+    if (!ip_resp || !host_req || strlen(host_req) > sizeof(dns_resolve_cmd))
     {
-        LOG_ERR("host too long");
+        LOG_ERR("DNS resolve invalid arguments");
         return -EINVAL;
     }
 
@@ -322,6 +322,12 @@ static int modem_dns_resolve(struct bg9x_ssl_modem_data *data, const char *host_
 static int write_modem_file(struct bg9x_ssl_modem_data *data, const char *name, const char *file, size_t size)
 {
     int ret;
+    if (!file || size == 0 || !name || strlen(name) > sizeof("some_file_name_max"))
+    {
+        LOG_ERR("write modem file invalid arguments");
+        return -EINVAL;
+    }
+
     snprintk(del_file_cmd, sizeof(del_file_cmd), "AT+QFDEL=\"%s\"", name);
     snprintk(upload_file_cmd, sizeof(upload_file_cmd), "AT+QFUPL=\"%s\",%d", name, size);
 
