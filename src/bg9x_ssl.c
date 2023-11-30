@@ -169,8 +169,7 @@ static bool modem_cellular_is_registered(struct bg9x_ssl_modem_data *data)
            (data->registration_status_lte == 5);
 }
 
-static void on_cxreg_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
-                              void *user_data)
+static void on_cxreg_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
     uint8_t registration_status;
@@ -215,8 +214,7 @@ static void on_cxreg_match_cb(struct modem_chat *chat, char **argv, uint16_t arg
     }
 }
 
-static void upload_finish_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
-                                   void *user_data)
+static void upload_finish_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
     if (argc != 3 || atoi(argv[1]) != data->file_to_upload_size)
@@ -229,8 +227,24 @@ static void upload_finish_match_cb(struct modem_chat *chat, char **argv, uint16_
     }
 }
 
-static void upload_file_ready_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
-                                       void *user_data)
+static void qsslopen_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
+{
+    if (argc != 3)
+    {
+        LOG_ERR("Invalid socket open response");
+        return;
+    }
+
+    if (atoi(argv[2]) != 0)
+    {
+        LOG_ERR("Socket open failed with: %s", argv[2]);
+        return;
+    }
+
+    LOG_INFO("Socket open success");
+}
+
+static void upload_file_ready_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
 
@@ -265,10 +279,21 @@ static void upload_file_ready_match_cb(struct modem_chat *chat, char **argv, uin
 static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
                                  void *user_data)
 {
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
+
     if (argc == 3)
     {
-        struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
-        memcpy(data->last_resolved_ip, argv[2], 16);
+        // Remove surrounding quotes
+        char *start = argv[2];
+        size_t len = strlen(start);
+
+        if (start[0] == '"' && start[len - 1] == '"')
+        {
+            start[len - 1] = '\0';
+            start++;
+        }
+
+        memcpy(data->last_resolved_ip, start, strlen(start) + 1);
     }
     else
     {
@@ -296,6 +321,8 @@ MODEM_CHAT_MATCH_DEFINE(file_not_exist, MODEM_CME_ERR_FILE_DOES_NOT_EXIST, "", N
 MODEM_CHAT_MATCHES_DEFINE(delete_file_matches, ok_match, file_not_exist);
 
 MODEM_CHAT_MATCHES_DEFINE(abort_matches, MODEM_CHAT_MATCH("ERROR", "", NULL));
+
+MODEM_CHAT_MATCH_DEFINE(qsslopen_match, "+QSSLOPEN: ", ",", qsslopen_match_cb);
 
 MODEM_CHAT_MATCHES_DEFINE(unsol_matches,
                           MODEM_CHAT_MATCH("+CREG: ", ",", on_cxreg_match_cb),
@@ -369,6 +396,29 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_init_chat_script_cmds,
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_init_chat_script, bg9x_ssl_init_chat_script_cmds,
                          abort_matches, modem_cellular_chat_callback_handler, 10);
+
+char socket_open_cmd[sizeof("AT+QSSLOPEN:#,##,##\"255.255.255.255\",####,#")];
+MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_open_socket_chat_script_cmds,
+                              MODEM_CHAT_SCRIPT_CMD_RESP(socket_open_cmd, ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("", qsslopen_match), );
+
+MODEM_CHAT_SCRIPT_DEFINE(bg9x_open_socket_chat_script, bg9x_open_socket_chat_script_cmds,
+                         abort_matches, modem_cellular_chat_callback_handler, 10);
+
+static int open_socket(struct bg9x_ssl_modem_data *data, const char *ip, uint16_t port)
+{
+    int ret;
+    // TODO: check if socket is already open
+    // TODO: third paramter is socket, we can have more than one (0-11)
+
+    snprintk(socket_open_cmd, sizeof(socket_open_cmd), "AT+QSSLOPEN=1,0,1,\"%s\",%d,0", ip, port);
+    ret = modem_run_script_and_wait(data, &bg9x_open_socket_chat_script);
+    if (ret < 0)
+        return ret;
+
+    // TODO socket number
+    return 1;
+}
 
 static int modem_dns_resolve(struct bg9x_ssl_modem_data *data, const char *host_req, char *ip_resp)
 {
@@ -527,7 +577,7 @@ int bg9x_ssl_modem_power_on(const struct device *dev)
 
     // TEST DNS?
     char ip[17];
-    if (modem_dns_resolve(data, "www.google.com", ip) < 0)
+    if (modem_dns_resolve(data, "example.com", ip) < 0)
     {
         LOG_ERR("DNS resolve test failed");
         return -EINVAL;
@@ -535,6 +585,13 @@ int bg9x_ssl_modem_power_on(const struct device *dev)
 
     ip[16] = '\0';
     LOG_INF("Resolved DNS to %s", ip);
+
+    int sock = open_socket(data, ip, 443);
+    if (sock < 0)
+    {
+        LOG_ERR("Failed to open socket");
+        return -EINVAL;
+    }
 
     return 0;
 }
