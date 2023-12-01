@@ -18,6 +18,7 @@
 LOG_MODULE_REGISTER(modem_quectel_bg9x_ssl, CONFIG_MODEM_LOG_LEVEL);
 
 #define DT_DRV_COMPAT quectel_bg95
+#define BUFFER_ACCESS_MODE 0
 #define CA_FILE_NAME "ca_file"
 #define CLIENT_CERT_FILE_NAME "cl_c_file"
 #define CLIENT_KEY_FILE_NAME "cl_k_file"
@@ -86,8 +87,8 @@ struct bg9x_ssl_modem_data
     const uint8_t *client_key;
 
     // files
-    const uint8_t *file_to_upload;
-    size_t file_to_upload_size;
+    const uint8_t *data_to_upload;
+    size_t data_to_upload_size;
 
     // dns
     char *last_resolved_ip[sizeof("255.255.255.255")];
@@ -214,10 +215,27 @@ static void on_cxreg_match_cb(struct modem_chat *chat, char **argv, uint16_t arg
     }
 }
 
+static void send_ok_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
+                             void *user_data)
+{
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
+
+    LOG_INF("Send data succeeded");
+    notify_modem_event(data, SCRIPT_FINISHED, 0);
+}
+
+static void send_fail_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
+{
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
+
+    LOG_ERR("Send: Connection is established but sending buffer is full");
+    notify_modem_event(data, SCRIPT_FINISHED, -EAGAIN);
+}
+
 static void upload_finish_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
-    if (argc != 3 || atoi(argv[1]) != data->file_to_upload_size)
+    if (argc != 3 || atoi(argv[1]) != data->data_to_upload_size)
     {
         LOG_ERR("Upload file data mismatch: argc = %d, argv[1] = %s", argc, argc >= 2 ? argv[1] : "NULL");
     }
@@ -244,28 +262,26 @@ static void qsslopen_match_cb(struct modem_chat *chat, char **argv, uint16_t arg
     LOG_INF("Socket open success");
 }
 
-static void upload_file_ready_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
+static size_t transmit_data(struct bg9x_ssl_modem_data *data, const uint8_t *buf, size_t len)
 {
-    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
-
-    const uint8_t *buf = data->file_to_upload;
     size_t max_chunk_size = sizeof(data->uart_backend_transmit_buf);
-    size_t size_left = data->file_to_upload_size;
+    size_t size_left = len;
     size_t chunk_size;
 
     if (!buf || size_left == 0)
     {
-        LOG_ERR("Invalid file to upload");
-        return;
+        LOG_ERR("Invalid data to upload");
+        return 0;
     }
 
     while (size_left)
     {
+        // TODO: This can be made simpler, transmit already checks the chunk size, and returns the number of bytes sent
         chunk_size = size_left > max_chunk_size ? max_chunk_size : size_left;
         if (modem_pipe_transmit(data->uart_pipe, buf, chunk_size) < 0)
         {
             LOG_ERR("Failed to transmit file");
-            return;
+            return len - size_left;
         }
 
         buf += chunk_size;
@@ -273,7 +289,15 @@ static void upload_file_ready_match_cb(struct modem_chat *chat, char **argv, uin
         k_sleep(K_MSEC(100)); // Needed?
     }
 
-    LOG_INF("File of size %d transmitted", data->file_to_upload_size);
+    LOG_INF("Data of size %d transmitted", len);
+    return len;
+}
+
+static void transmit_file_ready_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
+{
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
+    if (transmit_data(data, data->data_to_upload, data->data_to_upload_size) != data->data_to_upload_size)
+        LOG_ERR("Failed to transmit data");
 }
 
 static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
@@ -304,11 +328,11 @@ static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t 
 static void resolve_dns_success_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
                                          void *user_data)
 {
-    LOG_INF("DNS resolved got success!!");
+    LOG_INF("DNS resolved got success");
 }
 
 MODEM_CHAT_MATCH_DEFINE(ok_match, "OK", "", NULL);
-MODEM_CHAT_MATCH_DEFINE(upload_file_match, "CONNECT", "", upload_file_ready_match_cb);
+MODEM_CHAT_MATCH_DEFINE(upload_file_match, "CONNECT", "", transmit_file_ready_match_cb);
 MODEM_CHAT_MATCH_DEFINE(cpin_match, "+CPIN: READY", "", NULL);
 
 // on successful dns resolve, we get at least 3 response. OK, +QIURC: "dnsgip, <result_code=0>" and +QIURC: "dnsgip", "IP"
@@ -320,11 +344,14 @@ MODEM_CHAT_MATCH_DEFINE(file_not_exist, MODEM_CME_ERR_FILE_DOES_NOT_EXIST, "", N
 
 MODEM_CHAT_MATCHES_DEFINE(delete_file_matches, ok_match, file_not_exist);
 
-MODEM_CHAT_MATCHES_DEFINE(abort_matches, MODEM_CHAT_MATCH("ERROR", "", NULL));
+MODEM_CHAT_MATCHES_DEFINE(abort_matches,
+                          MODEM_CHAT_MATCH("ERROR", "", NULL),
+                          MODEM_CHAT_MATCH("SEND_FAIL", "", send_fail_match_cb));
 
 MODEM_CHAT_MATCH_DEFINE(qsslopen_match, "+QSSLOPEN: ", ",", qsslopen_match_cb);
 
 MODEM_CHAT_MATCHES_DEFINE(unsol_matches,
+                          MODEM_CHAT_MATCH("SEND OK", ",", send_ok_match_cb),
                           MODEM_CHAT_MATCH("+CREG: ", ",", on_cxreg_match_cb),
                           MODEM_CHAT_MATCH("+CEREG: ", ",", on_cxreg_match_cb),
                           MODEM_CHAT_MATCH("+CGREG: ", ",", on_cxreg_match_cb));
@@ -341,13 +368,13 @@ static void modem_cellular_chat_callback_handler(struct modem_chat *chat,
 /* ~~~~~~~~~~~~~~~~~~~  UPLOAD FILE CHAT SCRIPT ~~~~~~~~~~~~~~~~~~~~~~ */
 
 // overwritten in write_modem_file
-char del_file_cmd[sizeof("AT+QFDEL=\"some_file_name_max\"")];
-char upload_file_cmd[sizeof("AT+QFUPL=\"some_file_name_max\",####")];
+char del_file_cmd_buf[sizeof("AT+QFDEL=\"some_file_name_max\"")];
+char upload_file_cmd_buf[sizeof("AT+QFUPL=\"some_file_name_max\",####")];
 
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_upload_file_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP_MULT(del_file_cmd, delete_file_matches),
-                              MODEM_CHAT_SCRIPT_CMD_RESP(upload_file_cmd, upload_file_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP_MULT(del_file_cmd_buf, delete_file_matches),
+                              MODEM_CHAT_SCRIPT_CMD_RESP(upload_file_cmd_buf, upload_file_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("", upload_finish_match), );
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_upload_file_chat_script, bg9x_ssl_upload_file_chat_script_cmds,
@@ -356,10 +383,10 @@ MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_upload_file_chat_script, bg9x_ssl_upload_file_
 /* ~~~~~~~~~~~~~~~~~~~  DNS RESOLVE CHAT SCRIPT ~~~~~~~~~~~~~~~~~~~~~~ */
 
 // overwritten in modem_dns_resolve functions
-char dns_resolve_cmd[sizeof("AT+QIDNSGIP=1,\"some_host_name_url_max#############\"")];
+char dns_resolve_cmd_buf[sizeof("AT+QIDNSGIP=1,\"some_host_name_url_max#############\"")];
 
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_resolve_dns_chat_script_cmds,
-                              MODEM_CHAT_SCRIPT_CMD_RESP(dns_resolve_cmd, ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP(dns_resolve_cmd_buf, ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("", resolve_dns_success_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("", resolve_dns_ip_match), );
 
@@ -397,13 +424,48 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_init_chat_script_cmds,
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_init_chat_script, bg9x_ssl_init_chat_script_cmds,
                          abort_matches, modem_cellular_chat_callback_handler, 10);
 
-char socket_open_cmd[sizeof("AT+QSSLOPEN:#,##,##\"255.255.255.255\",####,#")];
+// AT+QSSLOPEN=<pdpctxID>,<sslctxID>,<clientID>,<serveraddr>,<port>[,<access_mode>]
+char socket_open_cmd_buf[sizeof("AT+QSSLOPEN:#,##,##\"255.255.255.255\",####,#")];
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_open_socket_chat_script_cmds,
-                              MODEM_CHAT_SCRIPT_CMD_RESP(socket_open_cmd, ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP(socket_open_cmd_buf, ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("", qsslopen_match), );
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_open_socket_chat_script, bg9x_open_socket_chat_script_cmds,
                          abort_matches, modem_cellular_chat_callback_handler, 10);
+
+// AT+QSSLSEND=<clientID>,<sendlen>
+char socket_send_cmd_buf[sizeof("AT+QSSLSEND=##,####")];
+MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_socket_send_chat_script_cmds,
+                              MODEM_CHAT_SCRIPT_CMD_RESP_NONE(socket_send_cmd_buf, 500));
+
+MODEM_CHAT_SCRIPT_DEFINE(bg9x_socket_send_chat_script, bg9x_socket_send_chat_script_cmds,
+                         abort_matches, modem_cellular_chat_callback_handler, 10);
+
+static int socket_send(struct bg9x_ssl_modem_data *data, const uint8_t *buf, size_t len)
+{
+    int transmitted = 0;
+    int ret;
+    // TODO: third paramter is socket, we can have more than one (0-11)
+
+    snprintk(socket_send_cmd_buf, sizeof(socket_open_cmd_buf), "AT+QSSLSEND=1,%d", len);
+
+    modem_run_script_and_wait(data, &bg9x_socket_send_chat_script);
+
+    LOG_INF("Sending data of size %d", len);
+    transmitted = transmit_data(data, buf, len);
+    if (transmitted < len)
+    {
+        LOG_ERR("Failed to transmit all data. transmitted: %d out of %d", transmitted, len);
+        return transmitted;
+    }
+
+    // this waits on unsolicited command SEND_OK
+    ret = wait_on_modem_event(data, SCRIPT_FINISHED, K_SECONDS(5));
+    if (ret < 0)
+        return ret;
+
+    return transmitted;
+}
 
 static int open_socket(struct bg9x_ssl_modem_data *data, const char *ip, uint16_t port)
 {
@@ -411,7 +473,7 @@ static int open_socket(struct bg9x_ssl_modem_data *data, const char *ip, uint16_
     // TODO: check if socket is already open
     // TODO: third paramter is socket, we can have more than one (0-11)
 
-    snprintk(socket_open_cmd, sizeof(socket_open_cmd), "AT+QSSLOPEN=1,0,1,\"%s\",%d,0", ip, port);
+    snprintk(socket_open_cmd_buf, sizeof(socket_open_cmd_buf), "AT+QSSLOPEN=1,0,1,\"%s\",%d,%d", ip, port, BUFFER_ACCESS_MODE);
     ret = modem_run_script_and_wait(data, &bg9x_open_socket_chat_script);
     if (ret < 0)
         return ret;
@@ -424,13 +486,13 @@ static int modem_dns_resolve(struct bg9x_ssl_modem_data *data, const char *host_
 {
     int ret;
 
-    if (!ip_resp || !host_req || strlen(host_req) > sizeof(dns_resolve_cmd))
+    if (!ip_resp || !host_req || strlen(host_req) > sizeof(dns_resolve_cmd_buf))
     {
         LOG_ERR("DNS resolve invalid arguments");
         return -EINVAL;
     }
 
-    snprintk(dns_resolve_cmd, sizeof(dns_resolve_cmd), "AT+QIDNSGIP=1,\"%s\"", host_req);
+    snprintk(dns_resolve_cmd_buf, sizeof(dns_resolve_cmd_buf), "AT+QIDNSGIP=1,\"%s\"", host_req);
 
     ret = modem_run_script_and_wait(data, &bg9x_ssl_resolve_dns_chat_script);
     if (ret < 0)
@@ -460,11 +522,11 @@ static int write_modem_file(struct bg9x_ssl_modem_data *data, const char *name, 
         return -EINVAL;
     }
 
-    snprintk(del_file_cmd, sizeof(del_file_cmd), "AT+QFDEL=\"%s\"", name);
-    snprintk(upload_file_cmd, sizeof(upload_file_cmd), "AT+QFUPL=\"%s\",%d", name, size);
+    snprintk(del_file_cmd_buf, sizeof(del_file_cmd_buf), "AT+QFDEL=\"%s\"", name);
+    snprintk(upload_file_cmd_buf, sizeof(upload_file_cmd_buf), "AT+QFUPL=\"%s\",%d", name, size);
 
-    data->file_to_upload = file;
-    data->file_to_upload_size = size;
+    data->data_to_upload = file;
+    data->data_to_upload_size = size;
 
     return modem_run_script_and_wait(data, &bg9x_ssl_upload_file_chat_script);
 }
@@ -544,6 +606,25 @@ int bg9x_ssl_modem_interface_start(struct bg9x_ssl_modem_data *data)
     return ret;
 }
 
+const char REQUEST[] = "GET / HTTP/1.1\r\n"
+                       "Host: www.example.com\r\n"
+                       "authority: www.example.com\r\n"
+                       "accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7\r\n"
+                       "accept-language: en-US,en;q=0.9\r\n"
+                       "cache-control: max-age=0\r\n"
+                       "if-modified-since: Thu, 17 Oct 2019 07:18:26 GMT\r\n"
+                       "if-none-match: \"3147526947\"\r\n"
+                       "referer: https://www.google.com/\r\n"
+                       "sec-ch-ua: \"Google Chrome\";v=\"119\", \"Chromium\";v=\"119\", \"Not?A_Brand\";v=\"24\"\r\n"
+                       "sec-ch-ua-mobile: ?0\r\n"
+                       "sec-ch-ua-platform: \"Windows\"\r\n"
+                       "sec-fetch-dest: document\r\n"
+                       "sec-fetch-mode: navigate\r\n"
+                       "sec-fetch-site: cross-site\r\n"
+                       "sec-fetch-user: ?1\r\n"
+                       "upgrade-insecure-requests: 1\r\n"
+                       "user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36\r\n";
+
 int bg9x_ssl_modem_power_on(const struct device *dev)
 {
     // power pulse
@@ -596,6 +677,12 @@ int bg9x_ssl_modem_power_on(const struct device *dev)
     if (sock < 0)
     {
         LOG_ERR("Failed to open socket");
+        return -EINVAL;
+    }
+
+    if (socket_send(data, REQUEST, sizeof(REQUEST) /* - 1*/) < 0)
+    {
+        LOG_ERR("Failed to send data");
         return -EINVAL;
     }
 

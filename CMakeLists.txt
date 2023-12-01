@@ -48,3 +48,7 @@ if(${CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL} GREATER_EQUAL 2)
                                     ${gen_dir}/bg95_ssl_client_key.inc)
     endif()
 endif()
+
+
+
+target_compile_options(app PRIVATE -Wall -Werror -Wfatal-errors)
