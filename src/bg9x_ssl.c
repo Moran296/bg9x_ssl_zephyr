@@ -241,7 +241,7 @@ static void qsslopen_match_cb(struct modem_chat *chat, char **argv, uint16_t arg
         return;
     }
 
-    LOG_INFO("Socket open success");
+    LOG_INF("Socket open success");
 }
 
 static void upload_file_ready_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
@@ -448,7 +448,13 @@ static int modem_dns_resolve(struct bg9x_ssl_modem_data *data, const char *host_
 
 static int write_modem_file(struct bg9x_ssl_modem_data *data, const char *name, const uint8_t *file, size_t size)
 {
-    if (!file || size == 0 || !name || strlen(name) > sizeof("some_file_name_max"))
+    if (size == 0)
+    {
+        LOG_WRN("%s, file size is 0, skipping file write", name);
+        return 0;
+    }
+
+    if (!file || !name || strlen(name) > sizeof("some_file_name_max"))
     {
         LOG_ERR("write modem file invalid arguments");
         return -EINVAL;
