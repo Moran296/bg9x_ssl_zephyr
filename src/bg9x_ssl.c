@@ -45,6 +45,7 @@ enum bg9x_ssl_modem_events
 {
     SCRIPT_FINISHED,
     REGISTERED,
+    RECV_READY,
 };
 
 struct bg9x_ssl_modem_config
@@ -80,15 +81,20 @@ struct bg9x_ssl_modem_data
     uint8_t registration_status_lte;
     struct k_sem script_sem;
     struct k_sem registration_sem;
+    struct k_sem recv_sem;
 
     // certs
     const uint8_t *ca_cert;
     const uint8_t *client_cert;
     const uint8_t *client_key;
 
-    // files
+    // buffers
     const uint8_t *data_to_upload;
     size_t data_to_upload_size;
+
+    char *data_to_receive;
+    size_t data_to_receive_size;
+    size_t pipe_recv_total;
 
     // dns
     char *last_resolved_ip[sizeof("255.255.255.255")];
@@ -107,6 +113,9 @@ static int wait_on_modem_event(struct bg9x_ssl_modem_data *data,
         break;
     case REGISTERED:
         sem = &data->registration_sem;
+        break;
+    case RECV_READY:
+        sem = &data->recv_sem;
         break;
 
     default:
@@ -129,6 +138,9 @@ static void notify_modem_event(struct bg9x_ssl_modem_data *data,
         break;
     case REGISTERED:
         sem = &data->registration_sem;
+        break;
+    case RECV_READY:
+        sem = &data->recv_sem;
         break;
 
     default:
@@ -331,6 +343,15 @@ static void resolve_dns_success_match_cb(struct modem_chat *chat, char **argv, u
     LOG_INF("DNS resolved got success");
 }
 
+static void notify_recv_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
+                                 void *user_data)
+{
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
+
+    LOG_INF("notify unsolicited data recv");
+    notify_modem_event(data, RECV_READY, 0);
+}
+
 MODEM_CHAT_MATCH_DEFINE(ok_match, "OK", "", NULL);
 MODEM_CHAT_MATCH_DEFINE(upload_file_match, "CONNECT", "", transmit_file_ready_match_cb);
 MODEM_CHAT_MATCH_DEFINE(cpin_match, "+CPIN: READY", "", NULL);
@@ -350,8 +371,11 @@ MODEM_CHAT_MATCHES_DEFINE(abort_matches,
 
 MODEM_CHAT_MATCH_DEFINE(qsslopen_match, "+QSSLOPEN: ", ",", qsslopen_match_cb);
 
+// MODEM_CHAT_MATCH_DEFINE(recv_match, "+QSSLRECV:", " ", recv_match_cb);
+
 MODEM_CHAT_MATCHES_DEFINE(unsol_matches,
                           MODEM_CHAT_MATCH("SEND OK", ",", send_ok_match_cb),
+                          MODEM_CHAT_MATCH("+QSSLURC: \"recv\"", ",", notify_recv_match_cb),
                           MODEM_CHAT_MATCH("+CREG: ", ",", on_cxreg_match_cb),
                           MODEM_CHAT_MATCH("+CEREG: ", ",", on_cxreg_match_cb),
                           MODEM_CHAT_MATCH("+CGREG: ", ",", on_cxreg_match_cb));
@@ -465,6 +489,123 @@ static int socket_send(struct bg9x_ssl_modem_data *data, const uint8_t *buf, siz
         return ret;
 
     return transmitted;
+}
+
+// check if buffer ends with "\r\n\r\nOK"
+bool is_recv_finished(const char *buf, size_t size)
+{
+    if (size < 8)
+        return false;
+
+    return memcmp(buf + size - 8, "\r\n\r\nOK\r\n", 8) == 0;
+}
+
+const char *get_recv_start_pos(const char *buf, size_t size)
+{
+    if (size < 20)
+        return NULL;
+
+    const char *first_occurrence = strstr(buf, "\r\n");
+    if (first_occurrence == NULL)
+        return NULL;
+
+    const char *second_occurrence = strstr(first_occurrence + 2, "\r\n");
+    if (second_occurrence == NULL)
+        return NULL;
+
+    return second_occurrence + 2;
+}
+
+void pipe_recv_cb(struct modem_pipe *pipe, enum modem_pipe_event event,
+                  void *user_data)
+{
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
+    int ret;
+
+    switch (event)
+    {
+    case MODEM_PIPE_EVENT_RECEIVE_READY:
+
+        ret = modem_pipe_receive(pipe,
+                                 data->data_to_receive + data->pipe_recv_total,
+                                 sizeof(data->uart_backend_receive_buf) - data->pipe_recv_total);
+
+        data->pipe_recv_total += ret;
+        LOG_DBG("pipe received %d bytes", ret);
+
+        if (is_recv_finished(data->data_to_receive, data->pipe_recv_total))
+            notify_modem_event(data, RECV_READY, 0);
+
+        break;
+
+    default:
+        LOG_ERR("unexpected pipe event %d, event", event);
+    }
+}
+
+static int socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, size_t requested_size, k_timeout_t timeout)
+{
+    char socket_recv_cmd_buf[sizeof("AT+QSSLRECV=##,####")];
+    size_t recv_buf_ability = sizeof(data->uart_backend_receive_buf) - strlen("\r\n+QSSLRECV: ####\r\n") - sizeof("\r\n\r\nOK\r\n");
+    size_t max_len = requested_size > recv_buf_ability ? recv_buf_ability : requested_size;
+
+    // This waits on unsolicited commad +QSSLURC: "recv"
+    int ret = wait_on_modem_event(data, RECV_READY, timeout);
+    if (ret < 0)
+        return ret;
+
+    data->data_to_receive = buf;
+    data->data_to_receive_size = max_len;
+    data->pipe_recv_total = 0;
+
+    modem_chat_release(&data->chat);
+    modem_pipe_attach(data->uart_pipe, pipe_recv_cb, data);
+
+    // send the recv at command with the size of the buffer or the max uart receive buffer
+    snprintk(socket_recv_cmd_buf, sizeof(socket_recv_cmd_buf), "AT+QSSLRECV=1,%d\r", max_len);
+    LOG_INF("Sending %s", socket_recv_cmd_buf);
+    ret = modem_pipe_transmit(data->uart_pipe, socket_recv_cmd_buf, strlen(socket_recv_cmd_buf));
+    if (ret < 0)
+    {
+        LOG_ERR("Failed to transmit QSSLRECV: %d", ret);
+        goto exit;
+    }
+
+    ret = wait_on_modem_event(data, RECV_READY, timeout);
+    if (ret < 0)
+    {
+        LOG_ERR("Failed to receive data");
+        goto exit;
+    }
+
+    const char *start_pos = get_recv_start_pos(data->data_to_receive, data->pipe_recv_total);
+    if (start_pos == NULL)
+    {
+        LOG_ERR("Failed to parse recv response");
+        ret = -EIO;
+        goto exit;
+    }
+
+    size_t expected_size = atoi(strstr(data->data_to_receive, "+QSSLRECV: ") + strlen("+QSSLRECV: "));
+
+    // extract the response and OK from the buffer
+    size_t recv_size = data->pipe_recv_total - (start_pos - data->data_to_receive) - strlen("\r\n\r\nOK\r\n");
+    if (recv_size > requested_size)
+    {
+        LOG_ERR("Received more data than requested");
+        ret = -EIO;
+        goto exit;
+    }
+
+    memmove(data->data_to_receive, start_pos, recv_size);
+
+    ret = recv_size;
+    LOG_INF("recv got total %d bytes. expected_size is %d", recv_size, expected_size);
+
+exit:
+    modem_pipe_release(data->uart_pipe);
+    modem_chat_attach(&data->chat, data->uart_pipe);
+    return ret;
 }
 
 static int open_socket(struct bg9x_ssl_modem_data *data, const char *ip, uint16_t port)
@@ -686,6 +827,17 @@ int bg9x_ssl_modem_power_on(const struct device *dev)
         return -EINVAL;
     }
 
+    static uint8_t recv_buf[1024];
+
+    int received = socket_recv(data, recv_buf, sizeof(recv_buf), K_SECONDS(10));
+    if (received < 0)
+    {
+        LOG_ERR("Failed to receive data");
+        return -EINVAL;
+    }
+
+    LOG_INF("received %d", received);
+
     return 0;
 }
 
@@ -728,6 +880,7 @@ static int bg9x_ssl_init(const struct device *dev)
     gpio_pin_configure_dt(&config->power_gpio, GPIO_OUTPUT_INACTIVE);
     k_sem_init(&data->script_sem, 0, 1);
     k_sem_init(&data->registration_sem, 0, 1);
+    k_sem_init(&data->recv_sem, 0, 1);
 
     // init uart backend
     const struct modem_backend_uart_config uart_backend_config = {
