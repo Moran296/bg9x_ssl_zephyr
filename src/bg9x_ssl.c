@@ -1,3 +1,4 @@
+#include <string.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
@@ -79,14 +80,20 @@ struct bg9x_ssl_modem_data
     uint8_t registration_status_gsm;
     uint8_t registration_status_gprs;
     uint8_t registration_status_lte;
-    struct k_sem script_sem;
     struct k_sem registration_sem;
-    struct k_sem recv_sem;
 
     // certs
     const uint8_t *ca_cert;
     const uint8_t *client_cert;
     const uint8_t *client_key;
+
+    // ==== SOCKET RELATED ====
+    bool socket_connected;
+    bool socket_blocking;
+    bool socket_has_data;
+
+    struct k_sem script_sem;
+    struct k_sem recv_sem;
 
     // buffers
     const uint8_t *data_to_upload;
@@ -97,8 +104,25 @@ struct bg9x_ssl_modem_data
     size_t pipe_recv_total;
 
     // dns
+    // TODO: replace with sockaddr_storage linked list?
     char *last_resolved_ip[sizeof("255.255.255.255")];
 };
+
+extern char *strnstr(const char *haystack, const char *needle, size_t haystack_sz);
+
+static int try_atoi(const char *s)
+{
+    int ret;
+    char *endptr;
+
+    ret = (int)strtol(s, &endptr, 10);
+    if (!endptr || endptr == s)
+    {
+        return -EINVAL;
+    }
+
+    return ret;
+}
 
 static int wait_on_modem_event(struct bg9x_ssl_modem_data *data,
                                enum bg9x_ssl_modem_events event,
@@ -192,14 +216,20 @@ static void on_cxreg_match_cb(struct modem_chat *chat, char **argv, uint16_t arg
 
     if (argc == 2)
     {
-        registration_status = atoi(argv[1]);
+        registration_status = try_atoi(argv[1]);
     }
     else if (argc == 3)
     {
-        registration_status = atoi(argv[2]);
+        registration_status = try_atoi(argv[2]);
     }
     else
     {
+        return;
+    }
+
+    if (registration_status < 0)
+    {
+        LOG_ERR("Invalid registration status %d", registration_status);
         return;
     }
 
@@ -259,18 +289,22 @@ static void upload_finish_match_cb(struct modem_chat *chat, char **argv, uint16_
 
 static void qsslopen_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
 {
+    const int sock_open_success = 0;
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
+
     if (argc != 3)
     {
         LOG_ERR("Invalid socket open response");
         return;
     }
 
-    if (atoi(argv[2]) != 0)
+    if (try_atoi(argv[2]) != sock_open_success)
     {
         LOG_ERR("Socket open failed with: %s", argv[2]);
         return;
     }
 
+    data->socket_connected = true;
     LOG_INF("Socket open success");
 }
 
@@ -348,8 +382,19 @@ static void notify_recv_match_cb(struct modem_chat *chat, char **argv, uint16_t 
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
 
-    LOG_INF("notify unsolicited data recv");
+    LOG_INF("unsolicited: data recv");
     notify_modem_event(data, RECV_READY, 0);
+}
+
+static void notify_closed_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
+                                   void *user_data)
+{
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
+
+    LOG_INF("unsolicited: socket closed");
+    data->socket_has_data = false;
+    data->socket_connected = false;
+    k_sem_reset(&data->recv_sem);
 }
 
 MODEM_CHAT_MATCH_DEFINE(ok_match, "OK", "", NULL);
@@ -376,6 +421,7 @@ MODEM_CHAT_MATCH_DEFINE(qsslopen_match, "+QSSLOPEN: ", ",", qsslopen_match_cb);
 MODEM_CHAT_MATCHES_DEFINE(unsol_matches,
                           MODEM_CHAT_MATCH("SEND OK", ",", send_ok_match_cb),
                           MODEM_CHAT_MATCH("+QSSLURC: \"recv\"", ",", notify_recv_match_cb),
+                          MODEM_CHAT_MATCH("+QSSLURC: \"closed\"", ",", notify_closed_match_cb),
                           MODEM_CHAT_MATCH("+CREG: ", ",", on_cxreg_match_cb),
                           MODEM_CHAT_MATCH("+CEREG: ", ",", on_cxreg_match_cb),
                           MODEM_CHAT_MATCH("+CGREG: ", ",", on_cxreg_match_cb));
@@ -492,28 +538,118 @@ static int socket_send(struct bg9x_ssl_modem_data *data, const uint8_t *buf, siz
 }
 
 // check if buffer ends with "\r\n\r\nOK"
-bool is_recv_finished(const char *buf, size_t size)
+bool is_recv_finished(struct bg9x_ssl_modem_data *data)
 {
-    if (size < 8)
+    size_t size = data->pipe_recv_total;
+    const char *buf = data->data_to_receive;
+
+    if (size < ((sizeof("\r\n\r\nOK\r\n") - 1) + sizeof("\r\n+QSSLRECV: #\r\n")))
         return false;
 
-    return memcmp(buf + size - 8, "\r\n\r\nOK\r\n", 8) == 0;
+    const char *read_end = strnstr(buf, "\r\n\r\nOK\r\n", size);
+
+    // if position of read_end is not in range of size, ignore
+    if (read_end == NULL || read_end - buf > size - 8)
+        return false;
+
+    // check if socket is closed
+    const char *socket_closed_pos = strnstr(read_end, "\r\n+QSSLURC: \"closed\"", size - (read_end - buf));
+    if (socket_closed_pos != NULL && socket_closed_pos - buf <= size - 20)
+    {
+        LOG_DBG("recv finished and socket closed");
+        data->socket_connected = false;
+        data->socket_has_data = false;
+    }
+
+    return true;
 }
 
-const char *get_recv_start_pos(const char *buf, size_t size)
+int parse_recv_size(const char *buf, size_t size)
+{
+    if (size < 20)
+        return -EINVAL;
+
+    const char *start = strnstr(buf, "+QSSLRECV: ", 20);
+    if (start == NULL)
+        return -EINVAL;
+
+    start += strlen("+QSSLRECV: ");
+    return try_atoi(start);
+}
+
+const char *get_recv_data_start_pos(const char *buf, size_t size)
 {
     if (size < 20)
         return NULL;
 
-    const char *first_occurrence = strstr(buf, "\r\n");
+    const char *first_occurrence = strnstr(buf, "\r\n", 20);
     if (first_occurrence == NULL)
         return NULL;
 
-    const char *second_occurrence = strstr(first_occurrence + 2, "\r\n");
+    const char *second_occurrence = strnstr(first_occurrence + 2, "\r\n", 20);
     if (second_occurrence == NULL)
         return NULL;
 
     return second_occurrence + 2;
+}
+
+int parse_and_extract_recv_data(struct bg9x_ssl_modem_data *data)
+{
+    const char *start_pos;
+    char *end_pos;
+    int response_recv_size;
+    int actual_recv_size;
+    // int requested_size = data->data_to_receive_size;
+
+    // get position of data start after "\r\nqsslrecv: SIZE\r\n"
+    start_pos = get_recv_data_start_pos(data->data_to_receive, data->pipe_recv_total);
+    if (start_pos == NULL || start_pos == data->data_to_receive)
+    {
+        LOG_ERR("Failed to parse recv response");
+        return -EINVAL;
+    }
+
+    LOG_DBG("data start position %d", start_pos - data->data_to_receive);
+
+    // get the SIZE of the data to receive from "\r\n+qsslrecv: SIZE\r\n"
+    response_recv_size = parse_recv_size(data->data_to_receive, data->pipe_recv_total);
+    if (response_recv_size < 0)
+    {
+        LOG_ERR("Failed to parse recv size");
+        return response_recv_size;
+    }
+
+    LOG_DBG("response recv size %d", response_recv_size);
+
+    end_pos = strnstr(start_pos, "\r\n\r\nOK\r\n", data->pipe_recv_total - (start_pos - data->data_to_receive));
+    if (end_pos == NULL)
+    {
+        LOG_ERR("Failed to parse recv response end position");
+        return -EINVAL;
+    }
+
+    *end_pos = '\0';
+
+    // get size of data between "\r\n+qsslrecv: SIZE\r\n" and "\r\n\r\nOK\r\n"
+    actual_recv_size = end_pos - start_pos;
+    if (actual_recv_size < 0)
+    {
+        LOG_ERR("Invalid recv size: %d", actual_recv_size);
+        return -EINVAL;
+    }
+
+    if (actual_recv_size != response_recv_size)
+    {
+        LOG_ERR("Received data size mismatch. expected: %d, actual: %d", response_recv_size, actual_recv_size);
+        return -EINVAL;
+    }
+
+    LOG_DBG("Received total bytes %d", actual_recv_size);
+
+    // move data to the beginning of the buffer
+    memmove(data->data_to_receive, start_pos, actual_recv_size);
+
+    return actual_recv_size;
 }
 
 void pipe_recv_cb(struct modem_pipe *pipe, enum modem_pipe_event event,
@@ -530,10 +666,13 @@ void pipe_recv_cb(struct modem_pipe *pipe, enum modem_pipe_event event,
                                  data->data_to_receive + data->pipe_recv_total,
                                  sizeof(data->uart_backend_receive_buf) - data->pipe_recv_total);
 
-        data->pipe_recv_total += ret;
-        LOG_DBG("pipe received %d bytes", ret);
+        if (ret < 0)
+            LOG_ERR("Pipe failed to receive data: %d", ret);
 
-        if (is_recv_finished(data->data_to_receive, data->pipe_recv_total))
+        LOG_DBG("pipe received %d bytes", ret);
+        data->pipe_recv_total += ret;
+
+        if (is_recv_finished(data))
             notify_modem_event(data, RECV_READY, 0);
 
         break;
@@ -545,15 +684,26 @@ void pipe_recv_cb(struct modem_pipe *pipe, enum modem_pipe_event event,
 
 static int socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, size_t requested_size, k_timeout_t timeout)
 {
+    int ret;
     char socket_recv_cmd_buf[sizeof("AT+QSSLRECV=##,####")];
     size_t recv_buf_ability = sizeof(data->uart_backend_receive_buf) - strlen("\r\n+QSSLRECV: ####\r\n") - sizeof("\r\n\r\nOK\r\n");
     size_t max_len = requested_size > recv_buf_ability ? recv_buf_ability : requested_size;
 
-    // This waits on unsolicited commad +QSSLURC: "recv"
-    int ret = wait_on_modem_event(data, RECV_READY, timeout);
-    if (ret < 0)
-        return ret;
+    if (!data->socket_connected)
+    {
+        LOG_WRN("called recv when socket is not connected");
+        return 0;
+    }
 
+    // This waits on unsolicited command +QSSLURC: "recv"
+    if (!data->socket_has_data)
+    {
+        ret = wait_on_modem_event(data, RECV_READY, timeout);
+        if (ret < 0)
+            return ret;
+    }
+
+    data->socket_has_data = true;
     data->data_to_receive = buf;
     data->data_to_receive_size = max_len;
     data->pipe_recv_total = 0;
@@ -563,48 +713,43 @@ static int socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, size_t re
 
     // send the recv at command with the size of the buffer or the max uart receive buffer
     snprintk(socket_recv_cmd_buf, sizeof(socket_recv_cmd_buf), "AT+QSSLRECV=1,%d\r", max_len);
-    LOG_INF("Sending %s", socket_recv_cmd_buf);
-    ret = modem_pipe_transmit(data->uart_pipe, socket_recv_cmd_buf, strlen(socket_recv_cmd_buf));
-    if (ret < 0)
+
+    do
     {
-        LOG_ERR("Failed to transmit QSSLRECV: %d", ret);
-        goto exit;
-    }
+        // send request for reading data
+        LOG_INF("Sending %s...", socket_recv_cmd_buf);
+        ret = modem_pipe_transmit(data->uart_pipe, socket_recv_cmd_buf, strlen(socket_recv_cmd_buf));
+        if (ret < 0)
+        {
+            LOG_ERR("Failed to transmit QSSLRECV: %d", ret);
+            goto exit;
+        }
 
-    ret = wait_on_modem_event(data, RECV_READY, timeout);
-    if (ret < 0)
-    {
-        LOG_ERR("Failed to receive data");
-        goto exit;
-    }
+        // wait for reading until ending "/r/n/r/nOK/r/n"
+        ret = wait_on_modem_event(data, RECV_READY, timeout);
+        if (ret < 0)
+        {
+            LOG_ERR("Failed to receive data: %s", !data->socket_connected ? "socket closed" : "timeout");
+            goto exit;
+        }
 
-    const char *start_pos = get_recv_start_pos(data->data_to_receive, data->pipe_recv_total);
-    if (start_pos == NULL)
-    {
-        LOG_ERR("Failed to parse recv response");
-        ret = -EIO;
-        goto exit;
-    }
+        ret = parse_and_extract_recv_data(data);
+        if (ret < 0)
+        {
+            LOG_ERR("Failed to parse and extract recv data");
+            goto exit;
+        }
 
-    size_t expected_size = atoi(strstr(data->data_to_receive, "+QSSLRECV: ") + strlen("+QSSLRECV: "));
+        if (ret == 0)
+            data->socket_has_data = false;
 
-    // extract the response and OK from the buffer
-    size_t recv_size = data->pipe_recv_total - (start_pos - data->data_to_receive) - strlen("\r\n\r\nOK\r\n");
-    if (recv_size > requested_size)
-    {
-        LOG_ERR("Received more data than requested");
-        ret = -EIO;
-        goto exit;
-    }
-
-    memmove(data->data_to_receive, start_pos, recv_size);
-
-    ret = recv_size;
-    LOG_INF("recv got total %d bytes. expected_size is %d", recv_size, expected_size);
+    } while (data->socket_connected && data->socket_blocking && ret == 0);
 
 exit:
     modem_pipe_release(data->uart_pipe);
     modem_chat_attach(&data->chat, data->uart_pipe);
+    k_sem_reset(&data->recv_sem);
+
     return ret;
 }
 
@@ -620,9 +765,11 @@ static int open_socket(struct bg9x_ssl_modem_data *data, const char *ip, uint16_
         return ret;
 
     // TODO socket number
-    return 1;
+    return data->socket_connected ? 0 : -EIO;
 }
 
+// This currently only resolves one address into a buffer.
+// If we want to resolve multiple addresses, we need to support linked list addrinfo
 static int modem_dns_resolve(struct bg9x_ssl_modem_data *data, const char *host_req, char *ip_resp)
 {
     int ret;
@@ -829,6 +976,7 @@ int bg9x_ssl_modem_power_on(const struct device *dev)
 
     static uint8_t recv_buf[1024];
 
+    memset(recv_buf, 0, sizeof(recv_buf));
     int received = socket_recv(data, recv_buf, sizeof(recv_buf), K_SECONDS(10));
     if (received < 0)
     {
@@ -836,7 +984,22 @@ int bg9x_ssl_modem_power_on(const struct device *dev)
         return -EINVAL;
     }
 
+    received += socket_recv(data, recv_buf + received, sizeof(recv_buf) - received, K_SECONDS(10));
+    if (received < 0)
+    {
+        LOG_ERR("Failed to receive data");
+        return -EINVAL;
+    }
+
+    received += socket_recv(data, recv_buf + received, sizeof(recv_buf) - received, K_SECONDS(10));
+    if (received < 0)
+    {
+        LOG_ERR("Failed to receive data");
+        return -EINVAL;
+    }
+
     LOG_INF("received %d", received);
+    LOG_INF("%s", (const char *)recv_buf);
 
     return 0;
 }
@@ -876,6 +1039,8 @@ static int bg9x_ssl_init(const struct device *dev)
     data->ca_cert = NULL;     // allows CONFIG_BG9X_MODEM_SSL_CA_CERT to be used
     data->client_cert = NULL; // allows CONFIG_BG9X_MODEM_SSL_CLIENT_CERT to be used
     data->client_key = NULL;  // allows CONFIG_BG9X_MODEM_SSL_CLIENT_KEY to be used
+    data->socket_blocking = true;
+    data->socket_connected = false;
 
     gpio_pin_configure_dt(&config->power_gpio, GPIO_OUTPUT_INACTIVE);
     k_sem_init(&data->script_sem, 0, 1);
