@@ -54,7 +54,3 @@ config BG9X_MODEM_SSL_CLIENT_KEY
 endif
 
 endif # BG9X_MODEM_SSL
-
-menu "Zephyr Kernel"
-source "Kconfig.zephyr"
-endmenu

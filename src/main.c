@@ -14,7 +14,6 @@
 #include <zephyr/net/dns_resolve.h>
 #include <zephyr/pm/device.h>
 #include <zephyr/pm/device_runtime.h>
-#include "bg9x_ssl.h"
 
 static const struct device *modem = DEVICE_DT_GET(DT_ALIAS(modem));
 static struct gpio_dt_spec modem_enable = GPIO_DT_SPEC_GET(DT_ALIAS(modem_enable), gpios);
