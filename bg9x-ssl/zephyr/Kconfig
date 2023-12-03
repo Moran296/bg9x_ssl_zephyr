@@ -1,12 +1,12 @@
 config BG9X_MODEM_SSL
 	bool "Support for bg9x modem with offloaded ssl sockets"
-    select MODEM
+  select MODEM
 	select MODEM_MODULES
 	select MODEM_CHAT
 	select MODEM_PIPE
 	select MODEM_BACKEND_UART
-    select PM_DEVICE
-	# depends on DT_HAS_QUECTEL_BG95_ENABLED
+  select PM_DEVICE
+	depends on DT_HAS_QUECTEL_BG95_ENABLED
 	help
 	  This driver implements a modem driver for the BG9X
 	  with the SSL sockets offloaded to the modem.
