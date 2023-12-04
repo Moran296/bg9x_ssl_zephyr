@@ -12,7 +12,7 @@ zephyr_include_directories(.)
 set(gen_dir ${ZEPHYR_BINARY_DIR}/include/generated/)
 
 function(generate_cert_file CONFIG_NAME FILE_NAME)
-    if(NOT DEFINED ${CONFIG_NAME})
+    if(NOT DEFINED ${CONFIG_NAME} OR ${CONFIG_NAME} STREQUAL "")
         message(WARNING "No ${FILE_NAME} file specified. SSL will not work")
         file(WRITE ${gen_dir}/${FILE_NAME}.inc "")
     elseif(NOT EXISTS ${CMAKE_SOURCE_DIR}/${${CONFIG_NAME}})
