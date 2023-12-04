@@ -19,11 +19,12 @@
 LOG_MODULE_REGISTER(modem_quectel_bg9x_ssl, CONFIG_MODEM_LOG_LEVEL);
 
 #define DT_DRV_COMPAT quectel_bg95
-#define BUFFER_ACCESS_MODE 0
+#define QUECTEL_BUFFER_ACCESS_MODE 0
+#define QUECTEL_CME_ERR_FILE_DOES_NOT_EXIST "+CME ERROR: 405"
+
 #define CA_FILE_NAME "ca_file"
 #define CLIENT_CERT_FILE_NAME "cl_c_file"
 #define CLIENT_KEY_FILE_NAME "cl_k_file"
-#define MODEM_CME_ERR_FILE_DOES_NOT_EXIST "+CME ERROR: 405"
 #define SECLEVEL STRINGIFY(CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL)
 
 #if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 0
@@ -287,27 +288,6 @@ static void upload_finish_match_cb(struct modem_chat *chat, char **argv, uint16_
     }
 }
 
-static void qsslopen_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
-{
-    const int sock_open_success = 0;
-    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
-
-    if (argc != 3)
-    {
-        LOG_ERR("Invalid socket open response");
-        return;
-    }
-
-    if (try_atoi(argv[2]) != sock_open_success)
-    {
-        LOG_ERR("Socket open failed with: %s", argv[2]);
-        return;
-    }
-
-    data->socket_connected = true;
-    LOG_INF("Socket open success");
-}
-
 static size_t transmit_data(struct bg9x_ssl_modem_data *data, const uint8_t *buf, size_t len)
 {
     size_t max_chunk_size = sizeof(data->uart_backend_transmit_buf);
@@ -346,6 +326,167 @@ static void transmit_file_ready_match_cb(struct modem_chat *chat, char **argv, u
         LOG_ERR("Failed to transmit data");
 }
 
+static void notify_closed_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
+                                   void *user_data)
+{
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
+
+    LOG_INF("unsolicited: socket closed");
+    data->socket_has_data = false;
+    data->socket_connected = false;
+    k_sem_reset(&data->recv_sem);
+}
+
+static void notify_recv_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
+                                 void *user_data)
+{
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
+
+    LOG_INF("unsolicited: data recv");
+    notify_modem_event(data, RECV_READY, 0);
+}
+
+MODEM_CHAT_MATCH_DEFINE(ok_match, "OK", "", NULL);
+MODEM_CHAT_MATCH_DEFINE(upload_file_match, "CONNECT", "", transmit_file_ready_match_cb);
+MODEM_CHAT_MATCH_DEFINE(cpin_match, "+CPIN: READY", "", NULL);
+
+// on successful dns resolve, we get at least 3 response. OK, +QIURC: "dnsgip, <result_code=0>" and +QIURC: "dnsgip", "IP"
+MODEM_CHAT_MATCHES_DEFINE(abort_matches,
+                          MODEM_CHAT_MATCH("ERROR", "", NULL),
+                          MODEM_CHAT_MATCH("SEND_FAIL", "", send_fail_match_cb));
+
+MODEM_CHAT_MATCHES_DEFINE(unsol_matches,
+                          MODEM_CHAT_MATCH("SEND OK", ",", send_ok_match_cb),
+                          MODEM_CHAT_MATCH("+QSSLURC: \"recv\"", ",", notify_recv_match_cb),
+                          MODEM_CHAT_MATCH("+QSSLURC: \"closed\"", ",", notify_closed_match_cb),
+                          MODEM_CHAT_MATCH("+CREG: ", ",", on_cxreg_match_cb),
+                          MODEM_CHAT_MATCH("+CEREG: ", ",", on_cxreg_match_cb),
+                          MODEM_CHAT_MATCH("+CGREG: ", ",", on_cxreg_match_cb));
+
+static void modem_cellular_chat_callback_handler(struct modem_chat *chat,
+                                                 enum modem_chat_script_result result,
+                                                 void *user_data)
+{
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
+    int ret = result == MODEM_CHAT_SCRIPT_RESULT_SUCCESS ? 0 : -EIO;
+    notify_modem_event(data, SCRIPT_FINISHED, ret);
+}
+
+/*
+ * =======================================================================
+ *                          UPLOAD FILES FUNCTIONALITY
+ * =======================================================================
+ * This section contains code for uploading files to the modem.
+ * It includes writing CA cert, client certificate and key files.
+ * ========================================================================
+ */
+
+MODEM_CHAT_MATCH_DEFINE(upload_finish_match, "+QFUPL: ", ",", upload_finish_match_cb);
+MODEM_CHAT_MATCH_DEFINE(file_not_exist, QUECTEL_CME_ERR_FILE_DOES_NOT_EXIST, "", NULL);
+MODEM_CHAT_MATCHES_DEFINE(delete_file_matches, ok_match, file_not_exist);
+
+// overwritten in write_modem_file
+char del_file_cmd_buf[sizeof("AT+QFDEL=\"some_file_name_max\"")];
+char upload_file_cmd_buf[sizeof("AT+QFUPL=\"some_file_name_max\",####")];
+
+MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_upload_file_chat_script_cmds,
+                              MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP_MULT(del_file_cmd_buf, delete_file_matches),
+                              MODEM_CHAT_SCRIPT_CMD_RESP(upload_file_cmd_buf, upload_file_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("", upload_finish_match), );
+
+MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_upload_file_chat_script, bg9x_ssl_upload_file_chat_script_cmds,
+                         abort_matches, modem_cellular_chat_callback_handler, 10);
+
+static int write_modem_file(struct bg9x_ssl_modem_data *data, const char *name, const uint8_t *file, size_t size)
+{
+    if (size == 0)
+    {
+        LOG_WRN("%s, file size is 0, skipping file write", name);
+        return 0;
+    }
+
+    if (!file || !name || strlen(name) > sizeof("some_file_name_max"))
+    {
+        LOG_ERR("write modem file invalid arguments");
+        return -EINVAL;
+    }
+
+    snprintk(del_file_cmd_buf, sizeof(del_file_cmd_buf), "AT+QFDEL=\"%s\"", name);
+    snprintk(upload_file_cmd_buf, sizeof(upload_file_cmd_buf), "AT+QFUPL=\"%s\",%d", name, size);
+
+    data->data_to_upload = file;
+    data->data_to_upload_size = size;
+
+    return modem_run_script_and_wait(data, &bg9x_ssl_upload_file_chat_script);
+}
+
+static int bg9x_ssl_write_files(struct bg9x_ssl_modem_data *data)
+{
+    int ret;
+    size_t size;
+
+#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 0
+    if (data->ca_cert != NULL)
+    {
+        size = data->ca_cert == ca_cert_default ? sizeof(ca_cert_default) : strlen(data->ca_cert);
+        ret = write_modem_file(data, CA_FILE_NAME, data->ca_cert, size);
+        if (ret != 0)
+        {
+            LOG_ERR("Failed to write CA file: %d", ret);
+            return ret;
+        }
+
+        // nullify so will not reupload next connection
+        data->ca_cert = NULL;
+    }
+#endif
+
+#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 1
+    if (data->client_cert != NULL)
+    {
+        size = data->client_cert == client_cert_default ? sizeof(client_cert_default) : strlen(data->client_cert);
+        ret = write_modem_file(data, CLIENT_CERT_FILE_NAME, data->client_cert, size);
+        if (ret != 0)
+        {
+            LOG_ERR("Failed to write client cert file: %d", ret);
+            return ret;
+        }
+
+        // nullify so will not reupload next connection
+        data->client_cert = NULL
+    }
+
+    if (data->client_key != NULL)
+    {
+        size = data->client_key == client_key_default ? sizeof(client_key_default) : strlen(data->key_cert);
+        ret = write_modem_file(data, CLIENT_KEY_FILE_NAME, data->client_key, size);
+        if (ret != 0)
+        {
+            LOG_ERR("Failed to write client key file: %d", ret);
+            return ret;
+        }
+
+        // nullify so will not reupload next connection
+        data->client_key = NULL;
+    }
+
+#endif
+    LOG_DBG("Files written successfully");
+
+    return 0;
+}
+
+/*
+ * =======================================================================
+ *                          DNS RESOLVE FUNCTIONALITY
+ * =======================================================================
+ * This contains code for resolving dns address using AT+QIDNSGIP command.
+ * Currently only one address can be resolved at a time. The resolved ip is
+ * set in data->last_resolved_ip. This should be changed to support addrinfo
+ *
+ * ========================================================================
+ */
 static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
                                  void *user_data)
 {
@@ -377,80 +518,8 @@ static void resolve_dns_success_match_cb(struct modem_chat *chat, char **argv, u
     LOG_INF("DNS resolved got success");
 }
 
-static void notify_recv_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
-                                 void *user_data)
-{
-    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
-
-    LOG_INF("unsolicited: data recv");
-    notify_modem_event(data, RECV_READY, 0);
-}
-
-static void notify_closed_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
-                                   void *user_data)
-{
-    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
-
-    LOG_INF("unsolicited: socket closed");
-    data->socket_has_data = false;
-    data->socket_connected = false;
-    k_sem_reset(&data->recv_sem);
-}
-
-MODEM_CHAT_MATCH_DEFINE(ok_match, "OK", "", NULL);
-MODEM_CHAT_MATCH_DEFINE(upload_file_match, "CONNECT", "", transmit_file_ready_match_cb);
-MODEM_CHAT_MATCH_DEFINE(cpin_match, "+CPIN: READY", "", NULL);
-
-// on successful dns resolve, we get at least 3 response. OK, +QIURC: "dnsgip, <result_code=0>" and +QIURC: "dnsgip", "IP"
 MODEM_CHAT_MATCH_DEFINE(resolve_dns_success_match, "+QIURC: \"dnsgip\",0", ",", resolve_dns_success_match_cb);
 MODEM_CHAT_MATCH_DEFINE(resolve_dns_ip_match, "+QIURC: \"dnsgip\"", ",", resolve_dns_match_cb);
-
-MODEM_CHAT_MATCH_DEFINE(upload_finish_match, "+QFUPL: ", ",", upload_finish_match_cb);
-MODEM_CHAT_MATCH_DEFINE(file_not_exist, MODEM_CME_ERR_FILE_DOES_NOT_EXIST, "", NULL);
-
-MODEM_CHAT_MATCHES_DEFINE(delete_file_matches, ok_match, file_not_exist);
-
-MODEM_CHAT_MATCHES_DEFINE(abort_matches,
-                          MODEM_CHAT_MATCH("ERROR", "", NULL),
-                          MODEM_CHAT_MATCH("SEND_FAIL", "", send_fail_match_cb));
-
-MODEM_CHAT_MATCH_DEFINE(qsslopen_match, "+QSSLOPEN: ", ",", qsslopen_match_cb);
-
-// MODEM_CHAT_MATCH_DEFINE(recv_match, "+QSSLRECV:", " ", recv_match_cb);
-
-MODEM_CHAT_MATCHES_DEFINE(unsol_matches,
-                          MODEM_CHAT_MATCH("SEND OK", ",", send_ok_match_cb),
-                          MODEM_CHAT_MATCH("+QSSLURC: \"recv\"", ",", notify_recv_match_cb),
-                          MODEM_CHAT_MATCH("+QSSLURC: \"closed\"", ",", notify_closed_match_cb),
-                          MODEM_CHAT_MATCH("+CREG: ", ",", on_cxreg_match_cb),
-                          MODEM_CHAT_MATCH("+CEREG: ", ",", on_cxreg_match_cb),
-                          MODEM_CHAT_MATCH("+CGREG: ", ",", on_cxreg_match_cb));
-
-static void modem_cellular_chat_callback_handler(struct modem_chat *chat,
-                                                 enum modem_chat_script_result result,
-                                                 void *user_data)
-{
-    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
-    int ret = result == MODEM_CHAT_SCRIPT_RESULT_SUCCESS ? 0 : -EIO;
-    notify_modem_event(data, SCRIPT_FINISHED, ret);
-}
-
-/* ~~~~~~~~~~~~~~~~~~~  UPLOAD FILE CHAT SCRIPT ~~~~~~~~~~~~~~~~~~~~~~ */
-
-// overwritten in write_modem_file
-char del_file_cmd_buf[sizeof("AT+QFDEL=\"some_file_name_max\"")];
-char upload_file_cmd_buf[sizeof("AT+QFUPL=\"some_file_name_max\",####")];
-
-MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_upload_file_chat_script_cmds,
-                              MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP_MULT(del_file_cmd_buf, delete_file_matches),
-                              MODEM_CHAT_SCRIPT_CMD_RESP(upload_file_cmd_buf, upload_file_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("", upload_finish_match), );
-
-MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_upload_file_chat_script, bg9x_ssl_upload_file_chat_script_cmds,
-                         abort_matches, modem_cellular_chat_callback_handler, 10);
-
-/* ~~~~~~~~~~~~~~~~~~~  DNS RESOLVE CHAT SCRIPT ~~~~~~~~~~~~~~~~~~~~~~ */
 
 // overwritten in modem_dns_resolve functions
 char dns_resolve_cmd_buf[sizeof("AT+QIDNSGIP=1,\"some_host_name_url_max#############\"")];
@@ -463,20 +532,51 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_resolve_dns_chat_script_cmds,
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_resolve_dns_chat_script, bg9x_ssl_resolve_dns_chat_script_cmds,
                          abort_matches, modem_cellular_chat_callback_handler, 60);
 
-/* ~~~~~~~~~~~~~~~~~~~  SSL INIT CHAT SCRIPT ~~~~~~~~~~~~~~~~~~~~~~ */
+// This currently only resolves one address into a buffer.
+static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *host_req, char *ip_resp)
+{
+    int ret;
 
-MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_init_chat_script_cmds,
+    if (!ip_resp || !host_req || strlen(host_req) > sizeof(dns_resolve_cmd_buf))
+    {
+        LOG_ERR("DNS resolve invalid arguments");
+        return -EINVAL;
+    }
+
+    snprintk(dns_resolve_cmd_buf, sizeof(dns_resolve_cmd_buf), "AT+QIDNSGIP=1,\"%s\"", host_req);
+
+    ret = modem_run_script_and_wait(data, &bg9x_ssl_resolve_dns_chat_script);
+    if (ret < 0)
+        return ret;
+
+    if (data->last_resolved_ip[0] == 0)
+    {
+        LOG_ERR("Failed to resolve DNS");
+        return -EIO;
+    }
+
+    memcpy(ip_resp, data->last_resolved_ip, 16);
+    return 0;
+}
+
+/*
+ * =======================================================================
+ *                          MODEM CONFIGURE AND REGISTRATION
+ * =======================================================================
+ * This contains code for configuring the modem and registering to the network.
+ * It includes setting up the APN, PDP context, and registering to the network.
+ * It also configures the modem to use SSL and the SSL configuration.
+ *
+ * Currently it only supports using files if the compile time security level
+ * allows it (ca cert if seclevel >= 1. client cert and key if seclevel == 2).
+ * as long as files are configured here, this should run after the file upload step
+ *
+ * ========================================================================
+ */
+
+/* Configure SSL paramters (should run after upload files script) */
+MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_configure_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CPIN?", cpin_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
-                              // MODEM_CHAT_SCRIPT_CMD_RESP("AT+CREG=1", ok_match), -> not needed?
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGREG=1", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG=1", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGREG?", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG?", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QICSGP=1,1,\"" CONFIG_BG9X_MODEM_SSL_APN "\",\"\",\"\",3", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGPADDR=1", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QIACT=1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"sslversion\",1,4", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"ciphersuite\",1,0xFFFF", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"negotiatetime\",1,300", ok_match),
@@ -491,8 +591,83 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_init_chat_script_cmds,
 #endif
 );
 
-MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_init_chat_script, bg9x_ssl_init_chat_script_cmds,
+MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_configure_chat_script, bg9x_ssl_configure_chat_script_cmds,
                          abort_matches, modem_cellular_chat_callback_handler, 10);
+
+/* Register to the network and activate ssl context */
+MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_register_chat_script_cmds,
+                              MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CPIN?", cpin_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
+                              // MODEM_CHAT_SCRIPT_CMD_RESP("AT+CREG=1", ok_match), -> not needed?
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGREG=1", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG=1", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGREG?", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG?", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QICSGP=1,1,\"" CONFIG_BG9X_MODEM_SSL_APN "\",\"\",\"\",3", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGPADDR=1", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QIACT=1", ok_match), );
+
+MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_register_chat_script, bg9x_ssl_register_chat_script_cmds,
+                         abort_matches, modem_cellular_chat_callback_handler, 10);
+
+static int bg9x_ssl_configure(struct bg9x_ssl_modem_data *data)
+{
+    int ret;
+
+    ret = bg9x_ssl_write_files(data);
+    if (ret != 0)
+        return ret;
+
+    return modem_run_script_and_wait(data, &bg9x_ssl_configure_chat_script);
+}
+
+static int bg9x_ssl_modem_start(struct bg9x_ssl_modem_data *data)
+{
+    int ret;
+
+    ret = modem_run_script_and_wait(data, &bg9x_ssl_register_chat_script);
+    if (ret != 0)
+        return ret;
+
+    ret = wait_on_modem_event(data, REGISTERED, K_SECONDS(20));
+    if (ret != 0)
+        LOG_ERR("Modem did not register in time");
+
+    return ret;
+}
+
+/*
+ * =======================================================================
+ *                          MODEM SOCKET OPEN
+ * =======================================================================
+ * This contains code for socket open procedure
+ *
+ * ========================================================================
+ */
+
+static void qsslopen_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
+{
+    const int sock_open_success = 0;
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
+
+    if (argc != 3)
+    {
+        LOG_ERR("Invalid socket open response");
+        return;
+    }
+
+    if (try_atoi(argv[2]) != sock_open_success)
+    {
+        LOG_ERR("Socket open failed with: %s", argv[2]);
+        return;
+    }
+
+    data->socket_connected = true;
+    LOG_INF("socket open success");
+}
+
+MODEM_CHAT_MATCH_DEFINE(qsslopen_match, "+QSSLOPEN: ", ",", qsslopen_match_cb);
 
 // AT+QSSLOPEN=<pdpctxID>,<sslctxID>,<clientID>,<serveraddr>,<port>[,<access_mode>]
 char socket_open_cmd_buf[sizeof("AT+QSSLOPEN:#,##,##\"255.255.255.255\",####,#")];
@@ -503,6 +678,35 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_open_socket_chat_script_cmds,
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_open_socket_chat_script, bg9x_open_socket_chat_script_cmds,
                          abort_matches, modem_cellular_chat_callback_handler, 10);
 
+static int bg9x_ssl_open_socket(struct bg9x_ssl_modem_data *data, const char *ip, uint16_t port)
+{
+    int ret;
+    // TODO: check if socket is already open
+    // TODO: third paramter is socket, we can have more than one (0-11)
+
+    snprintk(socket_open_cmd_buf, sizeof(socket_open_cmd_buf), "AT+QSSLOPEN=1,0,1,\"%s\",%d,%d", ip, port, QUECTEL_BUFFER_ACCESS_MODE);
+    ret = modem_run_script_and_wait(data, &bg9x_open_socket_chat_script);
+    if (ret < 0)
+        return ret;
+
+    // TODO socket number
+    return data->socket_connected ? 0 : -EIO;
+}
+
+/*
+ * =======================================================================
+ *                          MODEM SOCKET SEND
+ * =======================================================================
+ * This contains code for sending data on a socket
+ *
+ * This implements sending in buffer access mode. First we request to send
+ * data of size X. The modem opens up a prompt ">".
+ * Then we send the data in chunks of size Y on the modem uart pipe until
+ * we have X. On that point the modem should acknowledge the data with
+ * "SEND OK" and we are done.
+ * ========================================================================
+ */
+
 // AT+QSSLSEND=<clientID>,<sendlen>
 char socket_send_cmd_buf[sizeof("AT+QSSLSEND=##,####")];
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_socket_send_chat_script_cmds,
@@ -511,12 +715,12 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_socket_send_chat_script_cmds,
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_socket_send_chat_script, bg9x_socket_send_chat_script_cmds,
                          abort_matches, modem_cellular_chat_callback_handler, 10);
 
-static int socket_send(struct bg9x_ssl_modem_data *data, const uint8_t *buf, size_t len)
+static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t *buf, size_t len)
 {
     int transmitted = 0;
     int ret;
-    // TODO: third paramter is socket, we can have more than one (0-11)
 
+    // TODO: third paramter is socket, we can have more than one (0-11)
     snprintk(socket_send_cmd_buf, sizeof(socket_open_cmd_buf), "AT+QSSLSEND=1,%d", len);
 
     modem_run_script_and_wait(data, &bg9x_socket_send_chat_script);
@@ -536,6 +740,25 @@ static int socket_send(struct bg9x_ssl_modem_data *data, const uint8_t *buf, siz
 
     return transmitted;
 }
+
+/*
+ * =======================================================================
+ *                          MODEM SOCKET RECEIVE
+ * =======================================================================
+ * This contains code for receiving data over a socket
+ *
+ * This code is a bit complicated and should be reviewed with care. The problem is
+ * that the chat mechanism does not handle unstructured data. So in order to receive
+ * data from the pipe, we need to detach the pipe from the chat and parse it manually.
+ *
+ * First an unsolicited command is received from the modem that data is ready.
+ * Than we detach the chat and manually send AT+QSSLRECV=1,<size> to the modem.
+ * We leave enough place in the buffer for "AT+QSSLRECV: <size>\r\n" that appears
+ * before the data and "\r\n\r\nOK\r\n" that appears after the data.
+ * This should also check if after the data there is a socket closed message
+ * (+QSSLURC: "closed") and set the socket_connected flag to false if so
+ * ========================================================================
+ */
 
 // check if buffer ends with "\r\n\r\nOK"
 bool is_recv_finished(struct bg9x_ssl_modem_data *data)
@@ -599,7 +822,6 @@ int parse_and_extract_recv_data(struct bg9x_ssl_modem_data *data)
     char *end_pos;
     int response_recv_size;
     int actual_recv_size;
-    // int requested_size = data->data_to_receive_size;
 
     // get position of data start after "\r\nqsslrecv: SIZE\r\n"
     start_pos = get_recv_data_start_pos(data->data_to_receive, data->pipe_recv_total);
@@ -682,7 +904,7 @@ void pipe_recv_cb(struct modem_pipe *pipe, enum modem_pipe_event event,
     }
 }
 
-static int socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, size_t requested_size, k_timeout_t timeout)
+static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, size_t requested_size, k_timeout_t timeout)
 {
     int ret;
     char socket_recv_cmd_buf[sizeof("AT+QSSLRECV=##,####")];
@@ -753,146 +975,23 @@ exit:
     return ret;
 }
 
-static int open_socket(struct bg9x_ssl_modem_data *data, const char *ip, uint16_t port)
-{
-    int ret;
-    // TODO: check if socket is already open
-    // TODO: third paramter is socket, we can have more than one (0-11)
-
-    snprintk(socket_open_cmd_buf, sizeof(socket_open_cmd_buf), "AT+QSSLOPEN=1,0,1,\"%s\",%d,%d", ip, port, BUFFER_ACCESS_MODE);
-    ret = modem_run_script_and_wait(data, &bg9x_open_socket_chat_script);
-    if (ret < 0)
-        return ret;
-
-    // TODO socket number
-    return data->socket_connected ? 0 : -EIO;
-}
-
-// This currently only resolves one address into a buffer.
-// If we want to resolve multiple addresses, we need to support linked list addrinfo
-static int modem_dns_resolve(struct bg9x_ssl_modem_data *data, const char *host_req, char *ip_resp)
-{
-    int ret;
-
-    if (!ip_resp || !host_req || strlen(host_req) > sizeof(dns_resolve_cmd_buf))
-    {
-        LOG_ERR("DNS resolve invalid arguments");
-        return -EINVAL;
-    }
-
-    snprintk(dns_resolve_cmd_buf, sizeof(dns_resolve_cmd_buf), "AT+QIDNSGIP=1,\"%s\"", host_req);
-
-    ret = modem_run_script_and_wait(data, &bg9x_ssl_resolve_dns_chat_script);
-    if (ret < 0)
-        return ret;
-
-    if (data->last_resolved_ip[0] == 0)
-    {
-        LOG_ERR("Failed to resolve DNS");
-        return -EIO;
-    }
-
-    memcpy(ip_resp, data->last_resolved_ip, 16);
-    return 0;
-}
-
-static int write_modem_file(struct bg9x_ssl_modem_data *data, const char *name, const uint8_t *file, size_t size)
-{
-    if (size == 0)
-    {
-        LOG_WRN("%s, file size is 0, skipping file write", name);
-        return 0;
-    }
-
-    if (!file || !name || strlen(name) > sizeof("some_file_name_max"))
-    {
-        LOG_ERR("write modem file invalid arguments");
-        return -EINVAL;
-    }
-
-    snprintk(del_file_cmd_buf, sizeof(del_file_cmd_buf), "AT+QFDEL=\"%s\"", name);
-    snprintk(upload_file_cmd_buf, sizeof(upload_file_cmd_buf), "AT+QFUPL=\"%s\",%d", name, size);
-
-    data->data_to_upload = file;
-    data->data_to_upload_size = size;
-
-    return modem_run_script_and_wait(data, &bg9x_ssl_upload_file_chat_script);
-}
-
-static int bg9x_ssl_modem_write_files(struct bg9x_ssl_modem_data *data)
-{
-    int ret;
-    const uint8_t *file;
-    size_t size;
-
-#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 0
-    file = data->ca_cert ? data->ca_cert : ca_cert_default;
-    size = data->ca_cert ? strlen(data->ca_cert) : sizeof(ca_cert_default);
-
-    ret = write_modem_file(data, CA_FILE_NAME, file, size);
-    if (ret != 0)
-    {
-        LOG_ERR("Failed to write CA file: %d", ret);
-        return ret;
-    }
-#endif
-
-#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 1
-    file = data->client_cert ? data->client_cert : client_cert_default;
-    size = data->client_cert ? strlen(data->client_cert) : sizeof(client_cert_default);
-
-    ret = write_modem_file(data, CLIENT_CERT_FILE_NAME, file, size);
-    if (ret != 0)
-    {
-        LOG_ERR("Failed to write client cert file: %d", ret);
-        return ret;
-    }
-
-    file = data->client_key ? data->client_key : client_key_default;
-    size = data->client_key ? strlen(data->client_key) : sizeof(client_key_default);
-
-    ret = write_modem_file(data, CLIENT_KEY_FILE_NAME, file, size);
-    if (ret != 0)
-    {
-        LOG_ERR("Failed to write client key file: %d", ret);
-        return ret;
-    }
-#endif
-    LOG_DBG("Files written successfully");
-
-    return 0;
-}
-
-static int run_interface_init_script(struct bg9x_ssl_modem_data *data)
-{
-    int ret;
-
-    ret = modem_run_script_and_wait(data, &bg9x_ssl_init_chat_script);
-    if (ret != 0)
-        return ret;
-
-    ret = wait_on_modem_event(data, REGISTERED, K_SECONDS(20));
-    if (ret != 0)
-    {
-        LOG_ERR("Modem did not register in time");
-        return ret;
-    }
-
-    return ret;
-}
-
 int bg9x_ssl_modem_interface_start(struct bg9x_ssl_modem_data *data)
 {
     int ret;
 
-    ret = bg9x_ssl_modem_write_files(data);
-    if (ret != 0)
+    ret = bg9x_ssl_configure(data);
+    if (ret < 0)
+    {
+        LOG_ERR("Failed to configure modem: %d", ret);
         return ret;
+    }
 
-    ret = run_interface_init_script(data);
+    ret = bg9x_ssl_modem_start(data);
 
     return ret;
 }
+
+//=============================== TEST TEST TEST ===================================
 
 const char REQUEST[] = "GET / HTTP/1.1\r\n"
                        "Host: www.example.com\r\n"
@@ -912,6 +1011,66 @@ const char REQUEST[] = "GET / HTTP/1.1\r\n"
                        "sec-fetch-user: ?1\r\n"
                        "upgrade-insecure-requests: 1\r\n"
                        "user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36\r\n";
+
+int test(const struct device *dev)
+{
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)dev->data;
+
+    // TEST DNS?
+    char ip[17];
+    if (bg9x_ssl_dns_resolve(data, "example.com", ip) < 0)
+    {
+        LOG_ERR("DNS resolve test failed");
+        return -EINVAL;
+    }
+
+    ip[16] = '\0';
+    LOG_INF("Resolved DNS to %s", ip);
+
+    int sock = bg9x_ssl_open_socket(data, ip, 443);
+    if (sock < 0)
+    {
+        LOG_ERR("Failed to open socket");
+        return -EINVAL;
+    }
+
+    if (bg9x_ssl_socket_send(data, REQUEST, sizeof(REQUEST)) < 0)
+    {
+        LOG_ERR("Failed to send data");
+        return -EINVAL;
+    }
+
+    static uint8_t recv_buf[1024];
+
+    memset(recv_buf, 0, sizeof(recv_buf));
+    int received = bg9x_ssl_socket_recv(data, recv_buf, sizeof(recv_buf), K_SECONDS(10));
+    if (received < 0)
+    {
+        LOG_ERR("Failed to receive data");
+        return -EINVAL;
+    }
+
+    received += bg9x_ssl_socket_recv(data, recv_buf + received, sizeof(recv_buf) - received, K_SECONDS(10));
+    if (received < 0)
+    {
+        LOG_ERR("Failed to receive data");
+        return -EINVAL;
+    }
+
+    received += bg9x_ssl_socket_recv(data, recv_buf + received, sizeof(recv_buf) - received, K_SECONDS(10));
+    if (received < 0)
+    {
+        LOG_ERR("Failed to receive data");
+        return -EINVAL;
+    }
+
+    LOG_INF("received %d", received);
+    LOG_INF("%s", (const char *)recv_buf);
+
+    return 0;
+}
+
+//=============================== TEST TEST TEST ===================================
 
 int bg9x_ssl_modem_power_on(const struct device *dev)
 {
@@ -950,58 +1109,8 @@ int bg9x_ssl_modem_power_on(const struct device *dev)
         return -EINVAL;
     }
 
-    // TEST DNS?
-    char ip[17];
-    if (modem_dns_resolve(data, "example.com", ip) < 0)
-    {
-        LOG_ERR("DNS resolve test failed");
-        return -EINVAL;
-    }
-
-    ip[16] = '\0';
-    LOG_INF("Resolved DNS to %s", ip);
-
-    int sock = open_socket(data, ip, 443);
-    if (sock < 0)
-    {
-        LOG_ERR("Failed to open socket");
-        return -EINVAL;
-    }
-
-    if (socket_send(data, REQUEST, sizeof(REQUEST) /* - 1*/) < 0)
-    {
-        LOG_ERR("Failed to send data");
-        return -EINVAL;
-    }
-
-    static uint8_t recv_buf[1024];
-
-    memset(recv_buf, 0, sizeof(recv_buf));
-    int received = socket_recv(data, recv_buf, sizeof(recv_buf), K_SECONDS(10));
-    if (received < 0)
-    {
-        LOG_ERR("Failed to receive data");
-        return -EINVAL;
-    }
-
-    received += socket_recv(data, recv_buf + received, sizeof(recv_buf) - received, K_SECONDS(10));
-    if (received < 0)
-    {
-        LOG_ERR("Failed to receive data");
-        return -EINVAL;
-    }
-
-    received += socket_recv(data, recv_buf + received, sizeof(recv_buf) - received, K_SECONDS(10));
-    if (received < 0)
-    {
-        LOG_ERR("Failed to receive data");
-        return -EINVAL;
-    }
-
-    LOG_INF("received %d", received);
-    LOG_INF("%s", (const char *)recv_buf);
-
-    return 0;
+    return test(dev);
+    // return 0;
 }
 
 int bg9x_ssl_modem_power_off(const struct device *dev)
@@ -1031,14 +1140,20 @@ static int modem_cellular_pm_action(const struct device *dev, enum pm_device_act
 }
 
 /* =========================== Device Init ============================================= */
+
 static int bg9x_ssl_init(const struct device *dev)
 {
     struct bg9x_ssl_modem_config *config = (struct bg9x_ssl_modem_config *)dev->config;
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)dev->data;
 
-    data->ca_cert = NULL;     // allows CONFIG_BG9X_MODEM_SSL_CA_CERT to be used
-    data->client_cert = NULL; // allows CONFIG_BG9X_MODEM_SSL_CLIENT_CERT to be used
-    data->client_key = NULL;  // allows CONFIG_BG9X_MODEM_SSL_CLIENT_KEY to be used
+#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 0
+    data->ca_cert = sizeof(ca_cert_default) > 0 ? ca_cert_default : NULL;
+#endif
+#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 1
+    data->client_cert = sizeof(client_cert_default) > 0 ? client_cert_default : NULL;
+    data->client_key = sizeof(client_key_default) > 0 ? client_key_default : NULL;
+#endif
+
     data->socket_blocking = true;
     data->socket_connected = false;
 
