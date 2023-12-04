@@ -1092,17 +1092,14 @@ int bg9x_ssl_modem_power_on(const struct device *dev)
     }
 
     LOG_INF("Powering on modem");
-    LOG_DBG("power_gpio on");
     gpio_pin_set_dt(&config->power_gpio, 1);
     k_sleep(K_MSEC(config->power_pulse_duration_ms));
 
-    LOG_DBG("power_gpio off");
     gpio_pin_set_dt(&config->power_gpio, 0);
     k_sleep(K_MSEC(config->startup_time_ms));
 
     LOG_DBG("Modem power pulse completed");
 
-    // TEST Configurations
     if (bg9x_ssl_modem_interface_start(data) < 0)
     {
         LOG_ERR("Failed to start modem interface");
