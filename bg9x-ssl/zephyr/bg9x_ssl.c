@@ -82,8 +82,7 @@ struct bg9x_ssl_modem_data
     uint8_t chat_filter[1];
     uint8_t *chat_argv[32];
 
-    // state
-    bool files_uploaded;
+    // reg state
     uint8_t registration_status_gsm;
     uint8_t registration_status_gprs;
     uint8_t registration_status_lte;
@@ -509,6 +508,12 @@ static int bg9x_ssl_write_files(struct bg9x_ssl_modem_data *data)
  * =======================================================================
  * This contains code for resolving dns address using AT+QIDNSGIP command.
  *
+ * We first send a AT+QIDNSGIP=1,"hostname" request with the host name.
+ * We wait for OK, then +QIURC: "dnsgip", <ResultCode>, <address_count>, <ttl>
+ * and then for each address for <address_count> we get +QIURC: "dnsgip","<IP_addr>"
+ * After we received all addresses and allocated them, we can release the semaphore and
+ * return the response.
+ *
  * ========================================================================
  */
 static struct zsock_addrinfo *generate_zsock_addr(struct bg9x_ssl_modem_data *data, const char *ip_addr)
@@ -550,7 +555,7 @@ static struct zsock_addrinfo *generate_zsock_addr(struct bg9x_ssl_modem_data *da
     return res;
 }
 
-static void parse_addr_info(struct bg9x_ssl_modem_data *data, char *arg)
+static struct zsock_addrinfo *parse_addr_info(struct bg9x_ssl_modem_data *data, char *arg)
 {
     // Remove surrounding quotes
     char *start = arg;
@@ -562,14 +567,21 @@ static void parse_addr_info(struct bg9x_ssl_modem_data *data, char *arg)
         start++;
     }
 
+    LOG_INF("DNS resolved to %s", start);
     struct zsock_addrinfo *addr = generate_zsock_addr(data, start);
     if (!addr)
     {
         LOG_ERR("Failed to generate zsock addr");
-        return;
+        return NULL;
     }
 
-    LOG_INF("DNS resolved to %s", start);
+    return addr;
+}
+
+int add_addr_info_to_res(struct bg9x_ssl_modem_data *data, struct zsock_addrinfo *addr)
+{
+    if (!addr)
+        return -1;
 
     int number_of_addresses = 1;
     if (!data->last_resolved_addr_info)
@@ -588,10 +600,7 @@ static void parse_addr_info(struct bg9x_ssl_modem_data *data, char *arg)
         ptr->ai_next = addr;
     }
 
-    if (number_of_addresses == data->resolved_addr_count)
-    {
-        notify_modem_event(data, SCRIPT_FINISHED, 0);
-    }
+    return number_of_addresses;
 }
 
 static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
@@ -599,11 +608,29 @@ static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t 
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
 
-    LOG_INF("dns args = %d", argc);
+    // +QIURC: "dnsgip","<IP_addr>"
     if (argc == 3)
     {
-        parse_addr_info(data, argv[2]);
+        struct zsock_addrinfo *addr = parse_addr_info(data, argv[2]);
+        if (!addr)
+        {
+            LOG_ERR("Failed to parse addr info");
+            return;
+        }
+
+        int parsed_addresses = add_addr_info_to_res(data, addr);
+        if (parsed_addresses < 0)
+        {
+            LOG_ERR("Failure at parsing dns address");
+            notify_modem_event(data, SCRIPT_FINISHED, -EINVAL);
+        }
+        else if (parsed_addresses == data->resolved_addr_count)
+        {
+            LOG_INF("DNS resolved to %d addresses", parsed_addresses);
+            notify_modem_event(data, SCRIPT_FINISHED, 0);
+        }
     }
+    // +QIURC: "dnsgip",<ResultCode>,<address_count>,<ttl>
     else if (argc == 5)
     {
         LOG_DBG("DNS res code: %s", argv[2]);
@@ -633,7 +660,6 @@ MODEM_CHAT_MATCH_DEFINE(resolve_dns_ip_match, "+QIURC: \"dnsgip\"", ",", resolve
 
 // overwritten in modem_dns_resolve functions
 char dns_resolve_cmd_buf[sizeof("AT+QIDNSGIP=1,\"some_host_name_url_max#############\"")];
-
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_resolve_dns_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP(dns_resolve_cmd_buf, ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("", resolve_dns_ip_match), );
@@ -654,15 +680,20 @@ static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *ho
 
     if (data->last_resolved_addr_info != NULL)
     {
-        LOG_ERR("Last DNS records were not freed");
+        LOG_ERR("Last DNS records were not deallocated, first run freeaddrinfo with previous result");
         return -EINVAL;
     }
 
+    // create request and run
     snprintk(dns_resolve_cmd_buf, sizeof(dns_resolve_cmd_buf), "AT+QIDNSGIP=1,\"%s\"", host_req);
-
     ret = modem_run_script_and_wait(data, &bg9x_ssl_resolve_dns_chat_script);
     if (ret < 0)
         return ret;
+
+    // wait for all addresses to be resolved
+    bool resolved_all_addresses = wait_on_modem_event(data, SCRIPT_FINISHED, K_SECONDS(20)) == 0;
+    if (!resolved_all_addresses)
+        LOG_ERR("Could not resolve all addresses");
 
     if (data->last_resolved_addr_info == NULL)
     {
@@ -670,14 +701,7 @@ static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *ho
         return -EINVAL;
     }
 
-    int resolved_all_addresses = wait_on_modem_event(data, SCRIPT_FINISHED, K_SECONDS(20));
-    if (resolved_all_addresses != 0)
-    {
-        LOG_ERR("Could not resolve all addresses");
-    }
-
     *resp = data->last_resolved_addr_info;
-
     return 0;
 }
 
