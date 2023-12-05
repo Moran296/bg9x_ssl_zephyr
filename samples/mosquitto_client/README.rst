@@ -1,17 +1,12 @@
-.. _cellular_modem_sample:
+.. _bg9x_ssl_simplae_socket_sample:
 
-Cellular Modem Sample
+bg9x ssl simple socket sample
 ########################
 
 Overview
 ********
+TODO
 
-This sample consists of a simple application which powers on
-the modem, brings up the net interface, then sends a packet
-with pseudo random data to the endpoint test-endpoint.com,
-which is a publicly hosted server which runs the Python
-script found in the server folder. DNS is used to look
-up the IP of test-endpoint.com.
 
 Notes
 *****
@@ -51,7 +46,5 @@ devicetree node:
            };
    };
 
-Next, the UART API must be specified using ``CONFIG_UART_INTERRUPT_DRIVEN=y`` or
-``CONFIG_UART_ASYNC_API=y``. The driver doesn't support UART polling.
-
-Lastly, the APN must be configured using ``CONFIG_MODEM_CELLULAR_APN=""``.
+Next, the UART API must be specified using ``CONFIG_UART_ASYNC_API=y``. The driver doesn't support UART polling.
+Lastly, the APN must be configured using ``BG9X_MODEM_SSL_APN=""``.
