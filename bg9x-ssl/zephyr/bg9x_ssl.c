@@ -8,6 +8,7 @@
 #include <zephyr/modem/chat.h>
 #include <zephyr/modem/pipe.h>
 #include <zephyr/modem/backend/uart.h>
+#include <sockets_internal.h>
 
 #include <zephyr/pm/device.h>
 
@@ -22,6 +23,7 @@ LOG_MODULE_REGISTER(modem_quectel_bg9x_ssl, CONFIG_MODEM_LOG_LEVEL);
 #define QUECTEL_BUFFER_ACCESS_MODE 0
 #define QUECTEL_CME_ERR_FILE_DOES_NOT_EXIST "+CME ERROR: 405"
 
+#define MODEM_MAX_DATA_LENGTH 1024
 #define CA_FILE_NAME "ca_file"
 #define CLIENT_CERT_FILE_NAME "cl_c_file"
 #define CLIENT_KEY_FILE_NAME "cl_k_file"
@@ -63,11 +65,15 @@ struct bg9x_ssl_modem_config
 
 struct bg9x_ssl_modem_data
 {
+    // net interface related
+    struct net_if *net_iface;
+    uint8_t mac_addr[6];
+
     // uart backend
     struct modem_pipe *uart_pipe;
     struct modem_backend_uart uart_backend;
-    uint8_t uart_backend_receive_buf[512];
-    uint8_t uart_backend_transmit_buf[512];
+    uint8_t uart_backend_receive_buf[MODEM_MAX_DATA_LENGTH];
+    uint8_t uart_backend_transmit_buf[MODEM_MAX_DATA_LENGTH];
 
     // chat data
     struct modem_chat chat;
@@ -89,10 +95,10 @@ struct bg9x_ssl_modem_data
     const uint8_t *client_key;
 
     // ==== SOCKET RELATED ====
+    int fd;
     bool socket_connected;
     bool socket_blocking;
     bool socket_has_data;
-
     struct k_sem script_sem;
     struct k_sem recv_sem;
 
@@ -105,11 +111,28 @@ struct bg9x_ssl_modem_data
     size_t pipe_recv_total;
 
     // dns
-    // TODO: replace with sockaddr_storage linked list?
-    char *last_resolved_ip[sizeof("255.255.255.255")];
+    struct zsock_addrinfo *last_resolved_addr_info;
+    int resolved_addr_count;
 };
 
 extern char *strnstr(const char *haystack, const char *needle, size_t haystack_sz);
+static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data);
+static int offload_socket(int family, int type, int proto);
+
+static struct bg9x_ssl_modem_data modem_data = {
+    .chat_delimiter = {'\r'},
+    .chat_filter = {'\n'},
+};
+
+static struct bg9x_ssl_modem_config modem_config = {
+    .uart = DEVICE_DT_GET(DT_INST_BUS(0)),
+    .power_gpio = GPIO_DT_SPEC_INST_GET_OR(0, mdm_power_gpios, {}),
+    .reset_gpio = GPIO_DT_SPEC_INST_GET_OR(0, mdm_reset_gpios, {}),
+    .reset_pulse_duration_ms = 100,
+    .power_pulse_duration_ms = 1500,
+    .startup_time_ms = 10000,
+    .shutdown_time_ms = 5000,
+};
 
 static int try_atoi(const char *s)
 {
@@ -335,6 +358,8 @@ static void notify_closed_match_cb(struct modem_chat *chat, char **argv, uint16_
     data->socket_has_data = false;
     data->socket_connected = false;
     k_sem_reset(&data->recv_sem);
+    z_free_fd(data->fd);
+    data->fd = -1;
 }
 
 static void notify_recv_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
@@ -359,6 +384,7 @@ MODEM_CHAT_MATCHES_DEFINE(unsol_matches,
                           MODEM_CHAT_MATCH("SEND OK", ",", send_ok_match_cb),
                           MODEM_CHAT_MATCH("+QSSLURC: \"recv\"", ",", notify_recv_match_cb),
                           MODEM_CHAT_MATCH("+QSSLURC: \"closed\"", ",", notify_closed_match_cb),
+                          MODEM_CHAT_MATCH("+QIURC: \"dnsgip\"", ",", resolve_dns_match_cb),
                           MODEM_CHAT_MATCH("+CREG: ", ",", on_cxreg_match_cb),
                           MODEM_CHAT_MATCH("+CEREG: ", ",", on_cxreg_match_cb),
                           MODEM_CHAT_MATCH("+CGREG: ", ",", on_cxreg_match_cb));
@@ -482,29 +508,120 @@ static int bg9x_ssl_write_files(struct bg9x_ssl_modem_data *data)
  *                          DNS RESOLVE FUNCTIONALITY
  * =======================================================================
  * This contains code for resolving dns address using AT+QIDNSGIP command.
- * Currently only one address can be resolved at a time. The resolved ip is
- * set in data->last_resolved_ip. This should be changed to support addrinfo
  *
  * ========================================================================
  */
+static struct zsock_addrinfo *generate_zsock_addr(struct bg9x_ssl_modem_data *data, const char *ip_addr)
+{
+    struct sockaddr_in sa;
+    int result = inet_pton(AF_INET, ip_addr, &(sa.sin_addr));
+    if (result != 1)
+    {
+        LOG_ERR("Invalid IP address");
+        return NULL;
+    }
+
+    struct zsock_addrinfo *res;
+    struct sockaddr_in *addr;
+
+    res = calloc(1, sizeof(struct zsock_addrinfo));
+    if (!res)
+    {
+        return NULL;
+    }
+    addr = calloc(1, sizeof(struct sockaddr_in));
+    if (!addr)
+    {
+        free(res);
+        return NULL;
+    }
+
+    addr->sin_family = AF_INET;
+    addr->sin_addr = sa.sin_addr;
+    addr->sin_port = htons(0);
+
+    res->ai_family = AF_INET;
+    res->ai_socktype = SOCK_STREAM;
+    res->ai_protocol = IPPROTO_TCP;
+    res->ai_addr = (struct sockaddr *)addr;
+    res->ai_addrlen = sizeof(struct sockaddr_in);
+    res->ai_next = NULL;
+
+    return res;
+}
+
+static void parse_addr_info(struct bg9x_ssl_modem_data *data, char *arg)
+{
+    // Remove surrounding quotes
+    char *start = arg;
+    size_t len = strlen(start);
+
+    if (start[0] == '"' && start[len - 1] == '"')
+    {
+        start[len - 1] = '\0';
+        start++;
+    }
+
+    struct zsock_addrinfo *addr = generate_zsock_addr(data, start);
+    if (!addr)
+    {
+        LOG_ERR("Failed to generate zsock addr");
+        return;
+    }
+
+    LOG_INF("DNS resolved to %s", start);
+
+    int number_of_addresses = 1;
+    if (!data->last_resolved_addr_info)
+    {
+        data->last_resolved_addr_info = addr;
+    }
+    else
+    {
+        struct zsock_addrinfo *ptr = data->last_resolved_addr_info;
+        while (ptr->ai_next != NULL)
+        {
+            ptr = ptr->ai_next;
+            number_of_addresses++;
+        }
+
+        ptr->ai_next = addr;
+    }
+
+    if (number_of_addresses == data->resolved_addr_count)
+    {
+        notify_modem_event(data, SCRIPT_FINISHED, 0);
+    }
+}
+
 static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
                                  void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
 
+    LOG_INF("dns args = %d", argc);
     if (argc == 3)
     {
-        // Remove surrounding quotes
-        char *start = argv[2];
-        size_t len = strlen(start);
-
-        if (start[0] == '"' && start[len - 1] == '"')
+        parse_addr_info(data, argv[2]);
+    }
+    else if (argc == 5)
+    {
+        LOG_DBG("DNS res code: %s", argv[2]);
+        if (strcmp(argv[2], "0") != 0)
         {
-            start[len - 1] = '\0';
-            start++;
+            LOG_ERR("DNS resolve failed");
+            return;
         }
 
-        memcpy(data->last_resolved_ip, start, strlen(start) + 1);
+        int expected_addresses = try_atoi(argv[3]);
+        if (expected_addresses < 0)
+        {
+            LOG_ERR("Invalid DNS address count");
+            return;
+        }
+
+        data->resolved_addr_count = expected_addresses;
+        LOG_INF("DNS resolved to %d addresses", expected_addresses);
     }
     else
     {
@@ -512,13 +629,6 @@ static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t 
     }
 }
 
-static void resolve_dns_success_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
-                                         void *user_data)
-{
-    LOG_INF("DNS resolved got success");
-}
-
-MODEM_CHAT_MATCH_DEFINE(resolve_dns_success_match, "+QIURC: \"dnsgip\",0", ",", resolve_dns_success_match_cb);
 MODEM_CHAT_MATCH_DEFINE(resolve_dns_ip_match, "+QIURC: \"dnsgip\"", ",", resolve_dns_match_cb);
 
 // overwritten in modem_dns_resolve functions
@@ -526,20 +636,25 @@ char dns_resolve_cmd_buf[sizeof("AT+QIDNSGIP=1,\"some_host_name_url_max#########
 
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_resolve_dns_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP(dns_resolve_cmd_buf, ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("", resolve_dns_success_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("", resolve_dns_ip_match), );
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_resolve_dns_chat_script, bg9x_ssl_resolve_dns_chat_script_cmds,
-                         abort_matches, modem_cellular_chat_callback_handler, 60);
+                         abort_matches, modem_cellular_chat_callback_handler, 40);
 
 // This currently only resolves one address into a buffer.
-static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *host_req, char *ip_resp)
+static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *host_req, struct zsock_addrinfo **resp)
 {
     int ret;
 
-    if (!ip_resp || !host_req || strlen(host_req) > sizeof(dns_resolve_cmd_buf))
+    if (!resp || !host_req || strlen(host_req) > sizeof(dns_resolve_cmd_buf))
     {
         LOG_ERR("DNS resolve invalid arguments");
+        return -EINVAL;
+    }
+
+    if (data->last_resolved_addr_info != NULL)
+    {
+        LOG_ERR("Last DNS records were not freed");
         return -EINVAL;
     }
 
@@ -549,13 +664,20 @@ static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *ho
     if (ret < 0)
         return ret;
 
-    if (data->last_resolved_ip[0] == 0)
+    if (data->last_resolved_addr_info == NULL)
     {
-        LOG_ERR("Failed to resolve DNS");
-        return -EIO;
+        LOG_ERR("DNS resolve failed");
+        return -EINVAL;
     }
 
-    memcpy(ip_resp, data->last_resolved_ip, 16);
+    int resolved_all_addresses = wait_on_modem_event(data, SCRIPT_FINISHED, K_SECONDS(20));
+    if (resolved_all_addresses != 0)
+    {
+        LOG_ERR("Could not resolve all addresses");
+    }
+
+    *resp = data->last_resolved_addr_info;
+
     return 0;
 }
 
@@ -609,7 +731,7 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_register_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QIACT=1", ok_match), );
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_register_chat_script, bg9x_ssl_register_chat_script_cmds,
-                         abort_matches, modem_cellular_chat_callback_handler, 10);
+                         abort_matches, modem_cellular_chat_callback_handler, 150);
 
 static int bg9x_ssl_configure(struct bg9x_ssl_modem_data *data)
 {
@@ -692,6 +814,42 @@ static int bg9x_ssl_open_socket(struct bg9x_ssl_modem_data *data, const char *ip
     // TODO socket number
     return data->socket_connected ? 0 : -EIO;
 }
+/*
+ * =======================================================================
+ *                          MODEM SOCKET CLOSE
+ * =======================================================================
+ * This contains code for socket close procedure
+ *
+ * ========================================================================
+ */
+
+MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_close_socket_chat_script_cmds,
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCLOSE=1", ok_match), );
+
+MODEM_CHAT_SCRIPT_DEFINE(bg9x_close_socket_chat_script, bg9x_close_socket_chat_script_cmds,
+                         abort_matches, modem_cellular_chat_callback_handler, 10);
+
+static int bg9x_ssl_close_socket(struct bg9x_ssl_modem_data *data)
+{
+    int ret;
+
+    if (data->socket_connected == false)
+    {
+        LOG_DBG("Socket already closed");
+        return 0;
+    }
+
+    ret = modem_run_script_and_wait(data, &bg9x_close_socket_chat_script);
+    if (ret < 0)
+    {
+        LOG_ERR("Socket close failed with %d", ret);
+    }
+
+    data->socket_connected = false;
+    k_sem_reset(&data->recv_sem);
+
+    return 0;
+}
 
 /*
  * =======================================================================
@@ -723,6 +881,7 @@ static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t 
     // TODO: third paramter is socket, we can have more than one (0-11)
     snprintk(socket_send_cmd_buf, sizeof(socket_open_cmd_buf), "AT+QSSLSEND=1,%d", len);
 
+    // TODO: Modem might not respond with prompt (">") on time. curretly I don't know how to check it
     modem_run_script_and_wait(data, &bg9x_socket_send_chat_script);
 
     LOG_INF("Sending data of size %d", len);
@@ -760,7 +919,7 @@ static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t 
  * ========================================================================
  */
 
-// check if buffer ends with "\r\n\r\nOK"
+// check if buffer ends with "\r\n\r\nOK or \r\n+QSSLRECV: #\r\n"
 bool is_recv_finished(struct bg9x_ssl_modem_data *data)
 {
     size_t size = data->pipe_recv_total;
@@ -770,21 +929,26 @@ bool is_recv_finished(struct bg9x_ssl_modem_data *data)
         return false;
 
     const char *read_end = strnstr(buf, "\r\n\r\nOK\r\n", size);
+    const char *socket_closed_pos = strnstr(buf, "\r\n+QSSLURC: \"closed\"", size);
 
-    // if position of read_end is not in range of size, ignore
-    if (read_end == NULL || read_end - buf > size - 8)
-        return false;
-
-    // check if socket is closed
-    const char *socket_closed_pos = strnstr(read_end, "\r\n+QSSLURC: \"closed\"", size - (read_end - buf));
-    if (socket_closed_pos != NULL && socket_closed_pos - buf <= size - 20)
+    if (socket_closed_pos != NULL)
     {
-        LOG_DBG("recv finished and socket closed");
+        LOG_DBG("socket closed while reading");
+
         data->socket_connected = false;
         data->socket_has_data = false;
+        z_free_fd(data->fd);
+        data->fd = -1;
     }
 
-    return true;
+    if (read_end == NULL && socket_closed_pos != NULL)
+    {
+        LOG_WRN("socket closed while reading but no OK received");
+        notify_modem_event(data, RECV_READY, -EIO);
+        return false;
+    }
+
+    return read_end != NULL;
 }
 
 int parse_recv_size(const char *buf, size_t size)
@@ -991,86 +1155,194 @@ int bg9x_ssl_modem_interface_start(struct bg9x_ssl_modem_data *data)
     return ret;
 }
 
-//=============================== TEST TEST TEST ===================================
+/*
+ * =======================================================================
+ *                          Network IF and Socket Offloading
+ * =======================================================================
+ * ========================================================================
+ */
 
-const char REQUEST[] = "GET / HTTP/1.1\r\n"
-                       "Host: www.example.com\r\n"
-                       "authority: www.example.com\r\n"
-                       "accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7\r\n"
-                       "accept-language: en-US,en;q=0.9\r\n"
-                       "cache-control: max-age=0\r\n"
-                       "if-modified-since: Thu, 17 Oct 2019 07:18:26 GMT\r\n"
-                       "if-none-match: \"3147526947\"\r\n"
-                       "referer: https://www.google.com/\r\n"
-                       "sec-ch-ua: \"Google Chrome\";v=\"119\", \"Chromium\";v=\"119\", \"Not?A_Brand\";v=\"24\"\r\n"
-                       "sec-ch-ua-mobile: ?0\r\n"
-                       "sec-ch-ua-platform: \"Windows\"\r\n"
-                       "sec-fetch-dest: document\r\n"
-                       "sec-fetch-mode: navigate\r\n"
-                       "sec-fetch-site: cross-site\r\n"
-                       "sec-fetch-user: ?1\r\n"
-                       "upgrade-insecure-requests: 1\r\n"
-                       "user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36\r\n";
-
-int test(const struct device *dev)
+static int offload_connect(void *obj, const struct sockaddr *addr, socklen_t addrlen)
 {
-    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)dev->data;
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)obj;
+    struct sockaddr_in *addr_in = (struct sockaddr_in *)addr;
+    int ret;
+    char ip[INET_ADDRSTRLEN];
+    uint16_t port;
 
-    // TEST DNS?
-    char ip[17];
-    if (bg9x_ssl_dns_resolve(data, "example.com", ip) < 0)
+    if (!addr || addrlen != sizeof(struct sockaddr_in))
     {
-        LOG_ERR("DNS resolve test failed");
+        LOG_ERR("Invalid address");
         return -EINVAL;
     }
 
-    ip[16] = '\0';
-    LOG_INF("Resolved DNS to %s", ip);
+    if (inet_ntop(AF_INET, &(addr_in->sin_addr), ip, INET_ADDRSTRLEN) == NULL)
+    {
+        LOG_ERR("Failed to convert address to string");
+        return -EINVAL;
+    }
 
-    int sock = bg9x_ssl_open_socket(data, ip, 443);
-    if (sock < 0)
+    port = ntohs(addr_in->sin_port);
+
+    ret = bg9x_ssl_open_socket(data, ip, port);
+    if (ret != 0)
     {
         LOG_ERR("Failed to open socket");
-        return -EINVAL;
+        return ret;
     }
-
-    if (bg9x_ssl_socket_send(data, REQUEST, sizeof(REQUEST)) < 0)
-    {
-        LOG_ERR("Failed to send data");
-        return -EINVAL;
-    }
-
-    static uint8_t recv_buf[1024];
-
-    memset(recv_buf, 0, sizeof(recv_buf));
-    int received = bg9x_ssl_socket_recv(data, recv_buf, sizeof(recv_buf), K_SECONDS(10));
-    if (received < 0)
-    {
-        LOG_ERR("Failed to receive data");
-        return -EINVAL;
-    }
-
-    received += bg9x_ssl_socket_recv(data, recv_buf + received, sizeof(recv_buf) - received, K_SECONDS(10));
-    if (received < 0)
-    {
-        LOG_ERR("Failed to receive data");
-        return -EINVAL;
-    }
-
-    received += bg9x_ssl_socket_recv(data, recv_buf + received, sizeof(recv_buf) - received, K_SECONDS(10));
-    if (received < 0)
-    {
-        LOG_ERR("Failed to receive data");
-        return -EINVAL;
-    }
-
-    LOG_INF("received %d", received);
-    LOG_INF("%s", (const char *)recv_buf);
 
     return 0;
 }
 
-//=============================== TEST TEST TEST ===================================
+static int offload_close(void *obj)
+{
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)obj;
+
+    if (data->fd > 0)
+    {
+        z_free_fd(data->fd);
+        data->fd = -1;
+    }
+
+    return bg9x_ssl_close_socket(data);
+}
+
+static ssize_t offload_recvfrom(void *obj, void *buf, size_t len,
+                                int flags, struct sockaddr *from,
+                                socklen_t *fromlen)
+{
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)obj;
+
+    int ret;
+
+    // TODO: check that socket source matches the source in the socket (received in offload_connect)
+
+    ret = bg9x_ssl_socket_recv(data, (uint8_t *)buf, len, K_FOREVER);
+    if (ret < 0)
+    {
+        LOG_ERR("Failed to receive data");
+        return ret;
+    }
+
+    return ret;
+}
+
+static ssize_t offload_read(void *obj, void *buffer, size_t count)
+{
+    return offload_recvfrom(obj, buffer, count, 0, NULL, 0);
+}
+
+static ssize_t offload_sendto(void *obj, const void *buf, size_t len,
+                              int flags, const struct sockaddr *to,
+                              socklen_t tolen)
+{
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)obj;
+    int ret;
+
+    // TODO: check that socket destination matches the destination in the socket (received in offload_connect)
+
+    ret = bg9x_ssl_socket_send(data, (const uint8_t *)buf, len);
+    if (ret < 0)
+    {
+        LOG_ERR("Failed to send data");
+        return ret;
+    }
+
+    return ret;
+}
+
+static ssize_t offload_write(void *obj, const void *buffer, size_t count)
+{
+    return offload_sendto(obj, buffer, count, 0, NULL, 0);
+}
+
+int bg9x_ssl_getaddrinfo(const char *node, const char *service,
+                         const struct zsock_addrinfo *hints,
+                         struct zsock_addrinfo **res)
+{
+    if (node == NULL || res == NULL)
+    {
+        LOG_ERR("Invalid arguments");
+        return -EINVAL;
+    }
+
+    if (hints && hints->ai_family != AF_INET)
+    {
+        return -ENOTSUP;
+    }
+
+    return bg9x_ssl_dns_resolve(&modem_data, node, res);
+}
+
+void bg9x_ssl_freeaddrinfo(struct zsock_addrinfo *res)
+{
+    if (res == NULL)
+    {
+        return;
+    }
+
+    __ASSERT(res == modem_data.last_resolved_addr_info, "Invalid addrinfo! must be last resolved addrinfo");
+
+    while (res != NULL)
+    {
+        struct zsock_addrinfo *next = res->ai_next;
+        free(res->ai_addr);
+        free(res);
+        res = next;
+    }
+
+    modem_data.last_resolved_addr_info = NULL;
+    modem_data.resolved_addr_count = 0;
+}
+
+static const struct socket_op_vtable offload_socket_fd_op_vtable = {
+    .fd_vtable = {
+        .read = offload_read,
+        .write = offload_write,
+        .close = offload_close,
+        .ioctl = NULL,
+    },
+    .bind = NULL,
+    .connect = offload_connect,
+    .sendto = offload_sendto,
+    .recvfrom = offload_recvfrom,
+    .listen = NULL,
+    .accept = NULL,
+    // .sendmsg = offload_sendmsg,
+    .sendmsg = NULL,
+    .getsockopt = NULL,
+    .setsockopt = NULL,
+};
+
+const struct socket_dns_offload dns_vtable = {
+    .getaddrinfo = bg9x_ssl_getaddrinfo,
+    .freeaddrinfo = bg9x_ssl_freeaddrinfo,
+};
+
+/* Setup the Modem NET Interface. */
+static void modem_net_iface_init(struct net_if *iface)
+{
+    const struct device *dev = net_if_get_device(iface);
+    struct bg9x_ssl_modem_data *data = dev->data;
+
+    /* Direct socket offload used instead of net offload: */
+    net_if_set_link_addr(iface, data->mac_addr,
+                         sizeof(data->mac_addr),
+                         NET_LINK_ETHERNET);
+    data->net_iface = iface;
+
+    socket_offload_dns_register(&dns_vtable);
+    net_if_socket_offload_set(iface, offload_socket);
+}
+
+/*
+ * =======================================================================
+ *                          Device power management
+ * =======================================================================
+ * This should be respnsible for turning device on/off upon request
+ * Should this also be responsible for setting the device as network interface?
+ * ========================================================================
+ */
 
 int bg9x_ssl_modem_power_on(const struct device *dev)
 {
@@ -1106,8 +1378,7 @@ int bg9x_ssl_modem_power_on(const struct device *dev)
         return -EINVAL;
     }
 
-    return test(dev);
-    // return 0;
+    return 0;
 }
 
 int bg9x_ssl_modem_power_off(const struct device *dev)
@@ -1116,7 +1387,7 @@ int bg9x_ssl_modem_power_off(const struct device *dev)
     return 0;
 }
 
-static int modem_cellular_pm_action(const struct device *dev, enum pm_device_action action)
+static int bg9x_ssl_pm_action(const struct device *dev, enum pm_device_action action)
 {
     switch (action)
     {
@@ -1143,6 +1414,8 @@ static int bg9x_ssl_init(const struct device *dev)
     struct bg9x_ssl_modem_config *config = (struct bg9x_ssl_modem_config *)dev->config;
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)dev->data;
 
+    gpio_pin_configure_dt(&config->power_gpio, GPIO_OUTPUT_INACTIVE);
+
 #if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 0
     data->ca_cert = sizeof(ca_cert_default) > 0 ? ca_cert_default : NULL;
 #endif
@@ -1154,7 +1427,6 @@ static int bg9x_ssl_init(const struct device *dev)
     data->socket_blocking = true;
     data->socket_connected = false;
 
-    gpio_pin_configure_dt(&config->power_gpio, GPIO_OUTPUT_INACTIVE);
     k_sem_init(&data->script_sem, 0, 1);
     k_sem_init(&data->registration_sem, 0, 1);
     k_sem_init(&data->recv_sem, 0, 1);
@@ -1194,23 +1466,55 @@ static int bg9x_ssl_init(const struct device *dev)
     return 0;
 }
 
-static struct bg9x_ssl_modem_config modem_config = {
-    .uart = DEVICE_DT_GET(DT_INST_BUS(0)),
-    .power_gpio = GPIO_DT_SPEC_INST_GET_OR(0, mdm_power_gpios, {}),
-    .reset_gpio = GPIO_DT_SPEC_INST_GET_OR(0, mdm_reset_gpios, {}),
-    .reset_pulse_duration_ms = 100,
-    .power_pulse_duration_ms = 1500,
-    .startup_time_ms = 10000,
-    .shutdown_time_ms = 5000,
+static struct offloaded_if_api api_funcs = {
+    .iface_api.init = modem_net_iface_init,
 };
 
-static struct bg9x_ssl_modem_data modem_data = {
-    .chat_delimiter = {'\r'},
-    .chat_filter = {'\n'},
-};
+static bool offload_is_supported(int family, int type, int proto)
+{
+    // support IPv4 and IPv6
+    if (family != AF_INET && family != AF_INET6)
+        return false;
 
-PM_DEVICE_DT_INST_DEFINE(0, modem_cellular_pm_action);
-DEVICE_DT_INST_DEFINE(0, bg9x_ssl_init, PM_DEVICE_DT_INST_GET(0),
-                      &modem_data, &modem_config, POST_KERNEL, 99, NULL);
+    // support only TCP
+    if (type != SOCK_STREAM)
+        return false;
+
+    if (CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL == 0)
+        return proto == IPPROTO_TCP;
+
+    // support these tls versions. determined with AT+QSSLCFG="sslversion",4 == (TLS 1.0) | (TLS 1.1) | (TLS 1.2)
+    else if (proto != IPPROTO_TLS_1_0 && proto != IPPROTO_TLS_1_1 && proto != IPPROTO_TLS_1_2)
+        return false;
+
+    return true;
+}
+
+static int offload_socket(int family, int type, int proto)
+{
+    int fd = z_reserve_fd();
+    if (fd < 0)
+    {
+        return -EMFILE;
+    }
+
+    z_finalize_fd(fd, &modem_data, (const struct fd_op_vtable *)&offload_socket_fd_op_vtable);
+
+    modem_data.fd = fd;
+    return fd;
+}
+
+/* Register the device with the Power Management module. */
+PM_DEVICE_DT_INST_DEFINE(0, bg9x_ssl_pm_action);
+
+/* Register the device with the Networking stack. */
+NET_DEVICE_DT_INST_OFFLOAD_DEFINE(0, bg9x_ssl_init, PM_DEVICE_DT_INST_GET(0),
+                                  &modem_data, &modem_config,
+                                  80, // priority copied from bg9x_modem
+                                  &api_funcs, MODEM_MAX_DATA_LENGTH);
+
+/* Register NET sockets. */
+NET_SOCKET_OFFLOAD_REGISTER(quectel_bg9x_ssl, CONFIG_NET_SOCKETS_OFFLOAD_PRIORITY,
+                            AF_UNSPEC, offload_is_supported, offload_socket);
 
 /* =========================== Device Init ============================================= */
