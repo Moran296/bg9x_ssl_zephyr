@@ -1,0 +1,4 @@
+name: bg9x-ssl
+build:
+  cmake: zephyr
+  kconfig: zephyr/Kconfig
