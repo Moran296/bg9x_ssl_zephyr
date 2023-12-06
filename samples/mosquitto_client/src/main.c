@@ -157,7 +157,7 @@ void mqtt_evt_handler(struct mqtt_client *const client,
 
 static char *get_mqtt_payload(enum mqtt_qos qos)
 {
-	static char payload[] = "DOORS:OPEN_QoSx";
+	static char payload[] = "MORAN:OPEN_QoSx";
 
 	payload[strlen(payload) - 1] = '0' + qos;
 
@@ -353,7 +353,7 @@ static int publisher(void)
 		rc = process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);
 		SUCCESS_OR_BREAK(rc);
 
-		rc = publish(&client_ctx, MQTT_QOS_0_AT_MOST_ONCE);
+		rc = publish(&client_ctx, MQTT_QOS_1_AT_LEAST_ONCE);
 		PRINT_RESULT("mqtt_publish", rc);
 		SUCCESS_OR_BREAK(rc);
 
