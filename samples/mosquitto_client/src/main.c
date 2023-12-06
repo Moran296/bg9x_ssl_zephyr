@@ -19,13 +19,13 @@
 
 LOG_MODULE_REGISTER(MAIN);
 
-#define SERVER_PORT 1883
+#define SERVER_HOST "test.mosquitto.org"
+#define SERVER_PORT 8883
 #define APP_CONNECT_TIMEOUT_MS 2000
 #define APP_SLEEP_MSECS 500
 #define APP_CONNECT_TRIES 10
 #define APP_MQTT_BUFFER_SIZE 128
 #define MQTT_CLIENTID "zephyr_publisher"
-#define SERVER_ADDR "192.168.1.10"
 
 static const struct device *modem = DEVICE_DT_GET(DT_ALIAS(modem));
 static struct gpio_dt_spec modem_enable = GPIO_DT_SPEC_GET(DT_ALIAS(modem_enable), gpios);
@@ -199,12 +199,18 @@ static void broker_init(void)
 	struct sockaddr_in *broker4 = (struct sockaddr_in *)&broker;
 	struct addrinfo *result;
 
-	getaddrinfo("test.mosquitto.org", NULL, NULL, &result);
+	int ret = getaddrinfo(SERVER_HOST, NULL, NULL, &result);
+	if (ret != 0)
+	{
+		LOG_ERR("ERROR: getaddrinfo failed %d", ret);
+		return;
+	}
 
 	broker4->sin_family = AF_INET;
-	broker4->sin_port = htons(8883);
+	broker4->sin_port = htons(SERVER_PORT);
 	broker4->sin_addr.s_addr = ((struct sockaddr_in *)result->ai_addr)->sin_addr.s_addr;
-	// zsock_inet_pton(AF_INET, SERVER_ADDR, &broker4->sin_addr);
+
+	freeaddrinfo(result);
 }
 
 static void client_init(struct mqtt_client *client)
