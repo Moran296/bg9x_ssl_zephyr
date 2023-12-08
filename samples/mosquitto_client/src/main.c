@@ -354,21 +354,21 @@ static int publisher(void)
 		SUCCESS_OR_BREAK(rc);
 
 		rc = publish(&client_ctx, MQTT_QOS_0_AT_MOST_ONCE);
-		PRINT_RESULT("mqtt_publish", rc);
+		PRINT_RESULT("mqtt_publish QOS 0", rc);
 		SUCCESS_OR_BREAK(rc);
 
 		rc = process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);
 		SUCCESS_OR_BREAK(rc);
 
 		rc = publish(&client_ctx, MQTT_QOS_1_AT_LEAST_ONCE);
-		PRINT_RESULT("mqtt_publish", rc);
+		PRINT_RESULT("mqtt_publish QOS 1", rc);
 		SUCCESS_OR_BREAK(rc);
 
 		rc = process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);
 		SUCCESS_OR_BREAK(rc);
 
 		rc = publish(&client_ctx, MQTT_QOS_2_EXACTLY_ONCE);
-		PRINT_RESULT("mqtt_publish", rc);
+		PRINT_RESULT("mqtt_publish QOS 2", rc);
 		SUCCESS_OR_BREAK(rc);
 
 		rc = process_mqtt_and_sleep(&client_ctx, APP_SLEEP_MSECS);

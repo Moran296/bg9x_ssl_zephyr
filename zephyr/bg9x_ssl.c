@@ -342,34 +342,30 @@ static void upload_finish_match_cb(struct modem_chat *chat, char **argv, uint16_
     }
 }
 
-static size_t transmit_data(struct bg9x_ssl_modem_data *data, const uint8_t *buf, size_t len)
+static size_t modem_transmit_data(struct bg9x_ssl_modem_data *data, const uint8_t *buf, size_t len)
 {
-    size_t max_chunk_size = sizeof(data->uart_backend_transmit_buf);
-    size_t size_left = len;
-    size_t chunk_size;
+    size_t transmitted = 0;
+    int ret;
 
-    if (!buf || size_left == 0)
+    if (!buf || len == 0)
     {
         LOG_ERR("Invalid data to upload");
-        return 0;
+        return -EINVAL;
     }
 
-    while (size_left)
+    while (transmitted < len)
     {
-        // TODO: This can be made simpler, transmit already checks the chunk size, and returns the number of bytes sent
-        chunk_size = size_left > max_chunk_size ? max_chunk_size : size_left;
-        if (modem_pipe_transmit(data->uart_pipe, buf, chunk_size) < 0)
+        ret = modem_pipe_transmit(data->uart_pipe, buf + transmitted, len - transmitted);
+        if (ret <= 0)
         {
             LOG_ERR("Failed to transmit file");
-            return len - size_left;
+            return -EIO;
         }
 
-        buf += chunk_size;
-        size_left -= chunk_size;
+        transmitted += ret;
 
-        /* TODO: for every 1k sent, the modem replies "A", and only then we can send the next chunk
-           this is not implemented yet, so we wait 100ms between chunks */
-        if (size_left)
+        // only perform delay if we have more to send. This is critical for throughput
+        if (transmitted < len)
             k_sleep(K_MSEC(100));
     }
 
@@ -380,7 +376,7 @@ static size_t transmit_data(struct bg9x_ssl_modem_data *data, const uint8_t *buf
 static void transmit_file_ready_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
-    if (transmit_data(data, data->data_to_upload, data->data_to_upload_size) != data->data_to_upload_size)
+    if (modem_transmit_data(data, data->data_to_upload, data->data_to_upload_size) != data->data_to_upload_size)
         LOG_ERR("Failed to transmit data");
 }
 
@@ -964,7 +960,7 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_fetch_error_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match));
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_fetch_error_chat_script, bg9x_fetch_error_chat_script_cmds,
-                         abort_matches, modem_cellular_chat_callback_handler, 1);
+                         abort_matches, modem_cellular_chat_callback_handler, 5);
 
 static int bg9x_ssl_fetch_error(struct bg9x_ssl_modem_data *data)
 {
@@ -1027,21 +1023,87 @@ static enum bg9x_ssl_modem_socket_state bg9x_ssl_update_socket_state(struct bg9x
  * ========================================================================
  */
 
-MODEM_CHAT_MATCH_DEFINE(send_ok_match, "SEND OK", "", NULL);
+enum send_proccess_state
+{
+    SEND_STATE_UNKNOWN = -EINVAL,
+    SEND_STATE_ERROR = -EIO,
+    SEND_STATE_PROMPT = 1,
+    SEND_STATE_FINISHED = 2
+};
 
-// AT+QSSLSEND=<clientID>,<sendlen>
-char socket_send_cmd_buf[sizeof("AT+QSSLSEND=##,####")];
-MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_socket_send_chat_script_cmds,
-                              MODEM_CHAT_SCRIPT_CMD_RESP_NONE(socket_send_cmd_buf, 300),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("", send_ok_match), );
+void pipe_send_cb(struct modem_pipe *pipe, enum modem_pipe_event event,
+                  void *user_data)
+{
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
+    static const char send_ready_prompt[] = {'>', 0x20};
+    static char send_cmd_working_buf[30] = {0};
+    int ret;
 
-MODEM_CHAT_SCRIPT_DEFINE(bg9x_socket_send_chat_script, bg9x_socket_send_chat_script_cmds,
-                         abort_matches, modem_cellular_chat_callback_handler, 10);
+    switch (event)
+    {
+    case MODEM_PIPE_EVENT_RECEIVE_READY:
+        ret = modem_pipe_receive(pipe,
+                                 send_cmd_working_buf + data->pipe_recv_total,
+                                 sizeof(send_cmd_working_buf) - data->pipe_recv_total);
+        if (ret < 0)
+        {
+            notify_modem_error(data, SCRIPT_FINISHED, ret);
+            return;
+        }
+
+        data->pipe_recv_total += ret;
+        LOG_DBG("send pipe received %d bytes", ret);
+
+        // if we got more data than is reasonable
+        if (data->pipe_recv_total > sizeof(send_cmd_working_buf))
+        {
+            LOG_ERR("send buffer cmd overflow");
+            ret = SEND_STATE_UNKNOWN;
+        }
+        else if (memmem(send_cmd_working_buf, data->pipe_recv_total, send_ready_prompt, 2) != NULL)
+        {
+            LOG_DBG("prompt ready");
+            ret = SEND_STATE_PROMPT;
+        }
+        else if (memmem(send_cmd_working_buf, data->pipe_recv_total, "SEND OK", strlen("SEND OK")) != NULL)
+        {
+            LOG_DBG("send ok");
+            ret = SEND_STATE_FINISHED;
+        }
+        else if (memmem(send_cmd_working_buf, data->pipe_recv_total, "SEND FAIL", strlen("SEND FAIL")) != NULL)
+        {
+            LOG_DBG("send fail");
+            ret = SEND_STATE_ERROR;
+        }
+        else if (memmem(send_cmd_working_buf, data->pipe_recv_total, "ERROR", strlen("ERROR")) != NULL)
+        {
+            LOG_INF("send error");
+            ret = SEND_STATE_ERROR;
+        }
+        else
+        {
+            LOG_INF("break, buffer len %d is: %s", data->pipe_recv_total, send_cmd_working_buf);
+            break;
+        }
+
+        // reset working buffer and send response
+        data->pipe_recv_total = 0;
+        memset(send_cmd_working_buf, 0, sizeof(send_cmd_working_buf));
+        if (ret >= 0)
+            notify_modem_success(data, SCRIPT_FINISHED, ret);
+        else
+            notify_modem_error(data, SCRIPT_FINISHED, ret);
+
+        break;
+    default:
+        LOG_ERR("unexpected pipe event %d in send cb, event", event);
+    }
+}
 
 static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t *buf, size_t len)
 {
     int transmitted = 0;
-    int ret;
+    int ret = 0;
 
     if (data->socket_state != SSL_SOCKET_STATE_CONNECTED)
     {
@@ -1049,37 +1111,47 @@ static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t 
         return -ENOTCONN;
     }
 
-    // TODO: third paramter is socket, we can have more than one (0-11)
-    snprintk(socket_send_cmd_buf, sizeof(socket_open_cmd_buf), "AT+QSSLSEND=1,%d", len);
+    // ========= pipe detached mode, must reattach before function exit =========
+    data->pipe_recv_total = 0;
+    modem_chat_release(&data->chat);
+    modem_pipe_attach(data->uart_pipe, pipe_send_cb, data);
 
-    // TODO: Modem might not respond with prompt (">") on time. curretly I don't know how to check it
-    ret = modem_chat_script_run(&data->chat, &bg9x_socket_send_chat_script);
-    if (ret != 0)
-        return ret;
+    // transmit send request
+    char socket_send_cmd_buf[sizeof("AT+QSSLSEND=##,####\r\n")];
+    int qssl_send_len = snprintk(socket_send_cmd_buf, sizeof(socket_open_cmd_buf), "AT+QSSLSEND=1,%d\r\n", len);
+    modem_transmit_data(data, socket_send_cmd_buf, qssl_send_len);
 
-    // TODO: check if modem responded with prompt (">") on time
-    k_sleep(K_MSEC(320));
-    LOG_INF("Transmitting....");
-    transmitted = transmit_data(data, buf, len);
-    if (transmitted < len)
+    // expect propmt ">"
+    ret = wait_on_modem_event(data, SCRIPT_FINISHED, K_SECONDS(3));
+    if (ret != SEND_STATE_PROMPT)
     {
-        LOG_ERR("Failed to transmit all data. transmitted: %d out of %d", transmitted, len);
-        k_sem_reset(&data->script_event.sem);
-        return transmitted;
+        LOG_DBG("expected state prompt, got %d", ret);
+        ret = ret < 0 ? ret : -EINVAL;
+        goto exit;
     }
 
-    ret = wait_on_modem_event(data, SCRIPT_FINISHED, K_SECONDS(5));
+    // transmit user data
+    transmitted = modem_transmit_data(data, buf, len);
+    if (transmitted < len)
+        LOG_WRN("Failed to transmit all data. transmitted: %d out of %d", transmitted, len);
+
+    // expect "SEND OK" response
+    ret = wait_on_modem_event(data, SCRIPT_FINISHED, K_SECONDS(3));
+    if (ret != SEND_STATE_FINISHED)
+    {
+        LOG_DBG("expected state finished, got %d", ret);
+        ret = ret < 0 ? ret : -EIO;
+        goto exit;
+    }
+
+exit:
+    modem_pipe_release(data->uart_pipe);
+    modem_chat_attach(&data->chat, data->uart_pipe);
+    // ========= pipe detached mode, must reattach before function exit =========
+
     if (ret < 0)
     {
         bg9x_ssl_fetch_error(data);
-        LOG_ERR("Failed to send data: %d. last modem err = %d", ret, data->last_error);
-
-        if (bg9x_ssl_update_socket_state(data) != SSL_SOCKET_STATE_CONNECTED)
-        {
-            LOG_ERR("Socket diconnected while sending");
-            return -ECONNRESET;
-        }
-
         return ret;
     }
 
@@ -1266,7 +1338,7 @@ void pipe_recv_cb(struct modem_pipe *pipe, enum modem_pipe_event event,
         break;
 
     default:
-        LOG_ERR("unexpected pipe event %d, event", event);
+        LOG_ERR("unexpected pipe event %d in recv cb, event", event);
     }
 }
 
