@@ -51,32 +51,40 @@ enum bg9x_ssl_modem_events
     SCRIPT_FINISHED,
     REGISTERED,
     RECV_READY,
+    GETADDR_READY,
 };
 
 enum bg9x_ssl_modem_socket_state
 {
-    SSL_STATE_INITIAL = 0,
-    SSL_STATE_OPENING = 1,
-    SSL_STATE_CONNECTED = 2,
-    SSL_STATE_CLOSING = 4,
+    SSL_SOCKET_STATE_UNKNWON = -1,
+    SSL_SOCKET_STATE_INITIAL = 0,
+    SSL_SOCKET_STATE_OPENING = 1,
+    SSL_SOCKET_STATE_CONNECTED = 2,
+    SSL_SOCKET_STATE_CLOSING = 4,
 };
 
 const char *ssl_state_to_string(enum bg9x_ssl_modem_socket_state state)
 {
     switch (state)
     {
-    case SSL_STATE_INITIAL:
-        return "SSL_STATE_INITIAL";
-    case SSL_STATE_OPENING:
-        return "SSL_STATE_OPENING";
-    case SSL_STATE_CONNECTED:
-        return "SSL_STATE_CONNECTED";
-    case SSL_STATE_CLOSING:
-        return "SSL_STATE_CLOSING";
+    case SSL_SOCKET_STATE_INITIAL:
+        return "SSL_SOCKET_STATE_INITIAL";
+    case SSL_SOCKET_STATE_OPENING:
+        return "SSL_SOCKET_STATE_OPENING";
+    case SSL_SOCKET_STATE_CONNECTED:
+        return "SSL_SOCKET_STATE_CONNECTED";
+    case SSL_SOCKET_STATE_CLOSING:
+        return "SSL_SOCKET_STATE_CLOSING";
     default:
-        return "SSL_STATE_UNKNOWN";
+        return "SSL_SOCKET_STATE_UNKNOWN";
     }
 }
+
+struct modem_event
+{
+    struct k_sem sem;
+    int value;
+};
 
 struct bg9x_ssl_modem_config
 {
@@ -112,7 +120,7 @@ struct bg9x_ssl_modem_data
     uint8_t registration_status_gsm;
     uint8_t registration_status_gprs;
     uint8_t registration_status_lte;
-    struct k_sem registration_sem;
+    struct modem_event registration_event;
 
     // certs
     const uint8_t *ca_cert;
@@ -127,8 +135,8 @@ struct bg9x_ssl_modem_data
     enum bg9x_ssl_modem_socket_state socket_state;
     bool socket_blocking;
     bool socket_has_data;
-    struct k_sem script_sem;
-    struct k_sem recv_sem;
+    struct modem_event script_event;
+    struct modem_event recv_event;
 
     /** data ready poll signal */
     struct k_poll_signal sig_data_ready;
@@ -143,7 +151,8 @@ struct bg9x_ssl_modem_data
 
     // dns
     struct zsock_addrinfo *last_resolved_addr_info;
-    int resolved_addr_count;
+    int expected_addr_count;
+    struct modem_event getaddr_event;
 };
 
 extern char *strnstr(const char *haystack, const char *needle, size_t haystack_sz);
@@ -180,57 +189,62 @@ static int try_atoi(const char *s)
     return ret;
 }
 
+static struct modem_event *get_modem_event(struct bg9x_ssl_modem_data *data, enum bg9x_ssl_modem_events event)
+{
+    switch (event)
+    {
+    case SCRIPT_FINISHED:
+        return &data->script_event;
+    case REGISTERED:
+        return &data->registration_event;
+    case RECV_READY:
+        return &data->recv_event;
+    case GETADDR_READY:
+        return &data->getaddr_event;
+    default:
+        return NULL;
+    }
+}
+
 static int wait_on_modem_event(struct bg9x_ssl_modem_data *data,
                                enum bg9x_ssl_modem_events event,
                                k_timeout_t timeout)
 {
-    struct k_sem *sem = NULL;
+    struct modem_event *mevent = get_modem_event(data, event);
+    __ASSERT(mevent, "Invalid event");
 
-    switch (event)
-    {
-    case SCRIPT_FINISHED:
-        sem = &data->script_sem;
-        break;
-    case REGISTERED:
-        sem = &data->registration_sem;
-        break;
-    case RECV_READY:
-        sem = &data->recv_sem;
-        break;
+    int ret = k_sem_take(&mevent->sem, timeout);
 
-    default:
-        return -EINVAL;
-    }
+    // if timeout and user did not supply a error code, return timeout
+    if (ret != 0 && mevent->value == 0)
+        return ret;
 
-    return k_sem_take(sem, timeout);
+    ret = mevent->value;
+    mevent->value = 0;
+
+    return ret;
 }
 
-static void notify_modem_event(struct bg9x_ssl_modem_data *data,
+static void notify_modem_success(struct bg9x_ssl_modem_data *data,
+                                 enum bg9x_ssl_modem_events event,
+                                 int value)
+{
+    struct modem_event *mevent = get_modem_event(data, event);
+    __ASSERT(mevent, "Invalid event");
+
+    mevent->value = value;
+    k_sem_give(&mevent->sem);
+}
+
+static void notify_modem_error(struct bg9x_ssl_modem_data *data,
                                enum bg9x_ssl_modem_events event,
                                int error)
 {
-    struct k_sem *sem = NULL;
+    struct modem_event *mevent = get_modem_event(data, event);
+    __ASSERT(mevent, "Invalid event");
 
-    switch (event)
-    {
-    case SCRIPT_FINISHED:
-        sem = &data->script_sem;
-        break;
-    case REGISTERED:
-        sem = &data->registration_sem;
-        break;
-    case RECV_READY:
-        sem = &data->recv_sem;
-        break;
-
-    default:
-        return;
-    }
-
-    if (error != 0)
-        k_sem_reset(sem);
-    else
-        k_sem_give(sem);
+    mevent->value = error;
+    k_sem_reset(&mevent->sem);
 }
 
 static int modem_run_script_and_wait(struct bg9x_ssl_modem_data *data,
@@ -243,13 +257,7 @@ static int modem_run_script_and_wait(struct bg9x_ssl_modem_data *data,
         return ret;
 
     // K_FOREVER is not in effect, since timeout is defined in the script
-    ret = wait_on_modem_event(data, SCRIPT_FINISHED, K_FOREVER);
-    if (ret != 0)
-        LOG_ERR("script: %s failed with err %d", script->name, ret);
-    else
-        LOG_DBG("script: %s finished successfully", script->name);
-
-    return ret;
+    return wait_on_modem_event(data, SCRIPT_FINISHED, K_FOREVER);
 }
 
 static bool modem_cellular_is_registered(struct bg9x_ssl_modem_data *data)
@@ -304,7 +312,7 @@ static void on_cxreg_match_cb(struct modem_chat *chat, char **argv, uint16_t arg
 
     if (modem_cellular_is_registered(data))
     {
-        notify_modem_event(data, REGISTERED, 0);
+        notify_modem_success(data, REGISTERED, 0);
         LOG_INF("Modem registered");
     }
     else
@@ -318,7 +326,7 @@ static void send_fail_match_cb(struct modem_chat *chat, char **argv, uint16_t ar
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
 
     LOG_ERR("Send: Connection is established but sending buffer is full");
-    notify_modem_event(data, SCRIPT_FINISHED, -EAGAIN);
+    notify_modem_error(data, SCRIPT_FINISHED, -EAGAIN);
 }
 
 static void upload_finish_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
@@ -358,7 +366,11 @@ static size_t transmit_data(struct bg9x_ssl_modem_data *data, const uint8_t *buf
 
         buf += chunk_size;
         size_left -= chunk_size;
-        k_sleep(K_MSEC(100)); // Needed?
+
+        /* TODO: for every 1k sent, the modem replies "A", and only then we can send the next chunk
+           this is not implemented yet, so we wait 100ms between chunks */
+        if (size_left)
+            k_sleep(K_MSEC(100));
     }
 
     LOG_INF("Data of size %d transmitted", len);
@@ -372,8 +384,8 @@ static void transmit_file_ready_match_cb(struct modem_chat *chat, char **argv, u
         LOG_ERR("Failed to transmit data");
 }
 
-static void notify_closed_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
-                                   void *user_data)
+static void unsol_closed_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
+                                  void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
 
@@ -381,28 +393,27 @@ static void notify_closed_match_cb(struct modem_chat *chat, char **argv, uint16_
     bg9x_ssl_close_socket(data);
 }
 
-static void notify_recv_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
-                                 void *user_data)
+static void unsol_recv_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
+                                void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
 
     LOG_INF("unsolicited: data recv");
     k_poll_signal_raise(&data->sig_data_ready, 0);
-    notify_modem_event(data, RECV_READY, 0);
+    notify_modem_success(data, RECV_READY, 0);
 }
 
 MODEM_CHAT_MATCH_DEFINE(ok_match, "OK", "", NULL);
 MODEM_CHAT_MATCH_DEFINE(upload_file_match, "CONNECT", "", transmit_file_ready_match_cb);
 MODEM_CHAT_MATCH_DEFINE(cpin_match, "+CPIN: READY", "", NULL);
 
-// on successful dns resolve, we get at least 3 response. OK, +QIURC: "dnsgip, <result_code=0>" and +QIURC: "dnsgip", "IP"
 MODEM_CHAT_MATCHES_DEFINE(abort_matches,
                           MODEM_CHAT_MATCH("ERROR", "", NULL),
                           MODEM_CHAT_MATCH("SEND FAIL", "", send_fail_match_cb));
 
 MODEM_CHAT_MATCHES_DEFINE(unsol_matches,
-                          MODEM_CHAT_MATCH("+QSSLURC: \"recv\"", ",", notify_recv_match_cb),
-                          MODEM_CHAT_MATCH("+QSSLURC: \"closed\"", ",", notify_closed_match_cb),
+                          MODEM_CHAT_MATCH("+QSSLURC: \"recv\"", ",", unsol_recv_match_cb),
+                          MODEM_CHAT_MATCH("+QSSLURC: \"closed\"", ",", unsol_closed_match_cb),
                           MODEM_CHAT_MATCH("+QIURC: \"dnsgip\"", ",", resolve_dns_match_cb),
                           MODEM_CHAT_MATCH("+CREG: ", ",", on_cxreg_match_cb),
                           MODEM_CHAT_MATCH("+CEREG: ", ",", on_cxreg_match_cb),
@@ -413,8 +424,19 @@ static void modem_cellular_chat_callback_handler(struct modem_chat *chat,
                                                  void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
-    int ret = result == MODEM_CHAT_SCRIPT_RESULT_SUCCESS ? 0 : -EIO;
-    notify_modem_event(data, SCRIPT_FINISHED, ret);
+
+    if (result == MODEM_CHAT_SCRIPT_RESULT_SUCCESS)
+    {
+        notify_modem_success(data, SCRIPT_FINISHED, 0);
+    }
+    else
+    {
+        notify_modem_error(data,
+                           SCRIPT_FINISHED,
+                           result == MODEM_CHAT_SCRIPT_RESULT_ABORT
+                               ? -EAGAIN
+                               : -ETIMEDOUT);
+    }
 }
 
 /*
@@ -532,8 +554,8 @@ static int bg9x_ssl_write_files(struct bg9x_ssl_modem_data *data)
  * We first send a AT+QIDNSGIP=1,"hostname" request with the host name.
  * We wait for OK, then +QIURC: "dnsgip", <ResultCode>, <address_count>, <ttl>
  * and then for each address for <address_count> we get +QIURC: "dnsgip","<IP_addr>"
- * After we received all addresses and allocated them, we can release the semaphore and
- * return the response.
+ * After we received all addresses and allocated them, we can notify the GETADDR_READY
+ * event which will unblock the caller.
  *
  * ========================================================================
  */
@@ -599,12 +621,8 @@ static struct zsock_addrinfo *parse_addr_info(struct bg9x_ssl_modem_data *data, 
     return addr;
 }
 
-int add_addr_info_to_res(struct bg9x_ssl_modem_data *data, struct zsock_addrinfo *addr)
+void add_addr_info_to_res(struct bg9x_ssl_modem_data *data, struct zsock_addrinfo *addr)
 {
-    if (!addr)
-        return -1;
-
-    int number_of_addresses = 1;
     if (!data->last_resolved_addr_info)
     {
         data->last_resolved_addr_info = addr;
@@ -615,49 +633,54 @@ int add_addr_info_to_res(struct bg9x_ssl_modem_data *data, struct zsock_addrinfo
         while (ptr->ai_next != NULL)
         {
             ptr = ptr->ai_next;
-            number_of_addresses++;
         }
 
         ptr->ai_next = addr;
     }
+}
 
-    return number_of_addresses;
+static int count_addrinfo(struct bg9x_ssl_modem_data *data)
+{
+    int count = 0;
+    struct zsock_addrinfo *ptr = data->last_resolved_addr_info;
+    while (ptr != NULL)
+    {
+        count++;
+        ptr = ptr->ai_next;
+    }
+
+    return count;
 }
 
 static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
                                  void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
+    int address_count = 0;
+    int ret;
 
-    // +QIURC: "dnsgip","<IP_addr>"
+    // address resolution:  +QIURC: "dnsgip","<IP_addr>"
     if (argc == 3)
     {
         struct zsock_addrinfo *addr = parse_addr_info(data, argv[2]);
-        if (!addr)
-        {
-            LOG_ERR("Failed to parse addr info");
-            return;
-        }
+        add_addr_info_to_res(data, addr);
+        address_count = count_addrinfo(data);
 
-        int parsed_addresses = add_addr_info_to_res(data, addr);
-        if (parsed_addresses < 0)
+        if (address_count == data->expected_addr_count)
         {
-            LOG_ERR("Failure at parsing dns address");
-            notify_modem_event(data, SCRIPT_FINISHED, -EINVAL);
-        }
-        else if (parsed_addresses == data->resolved_addr_count)
-        {
-            LOG_INF("DNS resolved to %d addresses", parsed_addresses);
-            notify_modem_event(data, SCRIPT_FINISHED, 0);
+            notify_modem_success(data, GETADDR_READY, address_count);
         }
     }
-    // +QIURC: "dnsgip",<ResultCode>,<address_count>,<ttl>
+
+    // address res and count:  +QIURC: "dnsgip",<ResultCode>,<address_count>,<ttl>
     else if (argc == 5)
     {
         LOG_DBG("DNS res code: %s", argv[2]);
-        if (strcmp(argv[2], "0") != 0)
+        ret = try_atoi(argv[2]);
+        if (ret != 0)
         {
-            LOG_ERR("DNS resolve failed");
+            LOG_ERR("DNS resolve failed: %d", ret);
+            notify_modem_error(data, GETADDR_READY, -EINVAL);
             return;
         }
 
@@ -665,28 +688,26 @@ static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t 
         if (expected_addresses < 0)
         {
             LOG_ERR("Invalid DNS address count");
+            notify_modem_error(data, GETADDR_READY, -EINVAL);
             return;
         }
 
-        data->resolved_addr_count = expected_addresses;
-        LOG_INF("DNS resolved to %d addresses", expected_addresses);
+        data->expected_addr_count = expected_addresses;
+        LOG_DBG("DNS resolved to %d addresses", expected_addresses);
     }
     else
     {
-        LOG_ERR("Invalid DNS response");
+        LOG_ERR("Invalid DNS response...");
     }
 }
-
-MODEM_CHAT_MATCH_DEFINE(resolve_dns_ip_match, "+QIURC: \"dnsgip\"", ",", resolve_dns_match_cb);
 
 // overwritten in modem_dns_resolve functions
 char dns_resolve_cmd_buf[sizeof("AT+QIDNSGIP=1,\"some_host_name_url_max#############\"")];
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_resolve_dns_chat_script_cmds,
-                              MODEM_CHAT_SCRIPT_CMD_RESP(dns_resolve_cmd_buf, ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("", resolve_dns_ip_match), );
+                              MODEM_CHAT_SCRIPT_CMD_RESP(dns_resolve_cmd_buf, ok_match));
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_resolve_dns_chat_script, bg9x_ssl_resolve_dns_chat_script_cmds,
-                         abort_matches, modem_cellular_chat_callback_handler, 40);
+                         abort_matches, modem_cellular_chat_callback_handler, 5);
 
 // This currently only resolves one address into a buffer.
 static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *host_req, struct zsock_addrinfo **resp)
@@ -699,12 +720,6 @@ static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *ho
         return -EINVAL;
     }
 
-    if (data->last_resolved_addr_info != NULL)
-    {
-        LOG_ERR("Last DNS records were not deallocated, first run freeaddrinfo with previous result");
-        return -EINVAL;
-    }
-
     // create request and run
     snprintk(dns_resolve_cmd_buf, sizeof(dns_resolve_cmd_buf), "AT+QIDNSGIP=1,\"%s\"", host_req);
     ret = modem_run_script_and_wait(data, &bg9x_ssl_resolve_dns_chat_script);
@@ -712,9 +727,9 @@ static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *ho
         return ret;
 
     // wait for all addresses to be resolved
-    bool resolved_all_addresses = wait_on_modem_event(data, SCRIPT_FINISHED, K_SECONDS(20)) == 0;
-    if (!resolved_all_addresses)
-        LOG_ERR("Could not resolve all addresses");
+    int address_count = wait_on_modem_event(data, GETADDR_READY, K_SECONDS(40)) == 0;
+    if (address_count < 0)
+        LOG_ERR("Could not resolve all addresses: %d", address_count);
 
     if (data->last_resolved_addr_info == NULL)
     {
@@ -766,7 +781,6 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_register_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CPIN?", cpin_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
-                              // MODEM_CHAT_SCRIPT_CMD_RESP("AT+CREG=1", ok_match), -> not needed?
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGREG=1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG=1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGREG?", ok_match),
@@ -782,10 +796,12 @@ static int bg9x_ssl_configure(struct bg9x_ssl_modem_data *data)
 {
     int ret;
 
+    // write certs and key if supplied to modem
     ret = bg9x_ssl_write_files(data);
     if (ret != 0)
         return ret;
 
+    // configure ssl parameters
     return modem_run_script_and_wait(data, &bg9x_ssl_configure_chat_script);
 }
 
@@ -793,11 +809,13 @@ static int bg9x_ssl_modem_start(struct bg9x_ssl_modem_data *data)
 {
     int ret;
 
+    // run register script
     ret = modem_run_script_and_wait(data, &bg9x_ssl_register_chat_script);
     if (ret != 0)
         return ret;
 
-    ret = wait_on_modem_event(data, REGISTERED, K_SECONDS(20));
+    // wait for registration
+    ret = wait_on_modem_event(data, REGISTERED, K_SECONDS(60));
     if (ret != 0)
         LOG_ERR("Modem did not register in time");
 
@@ -830,7 +848,7 @@ static void qsslopen_match_cb(struct modem_chat *chat, char **argv, uint16_t arg
         return;
     }
 
-    data->socket_state = SSL_STATE_CONNECTED;
+    data->socket_state = SSL_SOCKET_STATE_CONNECTED;
     data->socket_blocking = true;
     LOG_INF("socket open success");
 }
@@ -849,7 +867,7 @@ MODEM_CHAT_SCRIPT_DEFINE(bg9x_open_socket_chat_script, bg9x_open_socket_chat_scr
 static int bg9x_ssl_open_socket(struct bg9x_ssl_modem_data *data, const char *ip, uint16_t port)
 {
     int ret;
-    if (data->socket_state == SSL_STATE_CONNECTED)
+    if (data->socket_state == SSL_SOCKET_STATE_CONNECTED)
     {
         LOG_ERR("Socket already connected");
         return -EISCONN;
@@ -862,31 +880,41 @@ static int bg9x_ssl_open_socket(struct bg9x_ssl_modem_data *data, const char *ip
     if (ret < 0)
         return ret;
 
-    return data->socket_state == SSL_STATE_CONNECTED ? 0 : -EIO;
+    return data->socket_state == SSL_SOCKET_STATE_CONNECTED ? 0 : -EIO;
 }
 /*
  * =======================================================================
  *                          MODEM SOCKET CLOSE
  * =======================================================================
- * This contains code for socket close procedure
+ * This contains code for socket close procedure.
+ * Close is a difficult beast because unsolicited close can appear while
+ * is sending/reading. So a call to socket_close can be made from any state
+ * and it cannot block.
  *
+ * a call to close should stop all other operations, set the socket state for closing
+ * and clear the socket data.
  * ========================================================================
  */
+
+static void socket_cleanup(struct bg9x_ssl_modem_data *data)
+{
+    data->socket_state = SSL_SOCKET_STATE_CLOSING;
+    data->socket_blocking = true;
+    data->socket_has_data = false;
+
+    // if user is waiting for data, reset the semaphore
+    notify_modem_error(data, RECV_READY, -ECONNRESET);
+    k_poll_signal_reset(&data->sig_data_ready);
+    z_free_fd(data->fd);
+    data->fd = -1;
+}
 
 static void close_socket_chat_callback_handler(struct modem_chat *chat,
                                                enum modem_chat_script_result result,
                                                void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
-
-    LOG_DBG("Socket closed and cleared!");
-    data->socket_state = SSL_STATE_INITIAL;
-    data->socket_blocking = true;
-    data->socket_has_data = false;
-    k_poll_signal_reset(&data->sig_data_ready);
-    k_sem_reset(&data->recv_sem);
-    z_free_fd(data->fd);
-    data->fd = -1;
+    data->socket_state = SSL_SOCKET_STATE_INITIAL;
 }
 
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_close_socket_chat_script_cmds,
@@ -897,12 +925,13 @@ MODEM_CHAT_SCRIPT_DEFINE(bg9x_close_socket_chat_script, bg9x_close_socket_chat_s
 
 static int bg9x_ssl_close_socket(struct bg9x_ssl_modem_data *data)
 {
-    if (data->socket_state == SSL_STATE_INITIAL)
+    if (data->socket_state == SSL_SOCKET_STATE_INITIAL)
     {
         LOG_DBG("Socket already closed");
         return 0;
     }
 
+    socket_cleanup(data);
     return modem_chat_script_run(&data->chat, &bg9x_close_socket_chat_script);
 }
 
@@ -954,13 +983,7 @@ static void get_ssl_state_match_cb(struct modem_chat *chat, char **argv, uint16_
     }
 
     LOG_DBG("ssl state = %s", ssl_state_to_string(atoi(argv[6])));
-    ssl_state = atoi(argv[6]);
     data->socket_state = ssl_state;
-
-    if (ssl_state == SSL_STATE_CLOSING)
-    {
-        bg9x_ssl_close_socket(data);
-    }
 }
 
 MODEM_CHAT_MATCH_DEFINE(get_ssl_state_match, "+QSSLSTATE", ",", get_ssl_state_match_cb);
@@ -970,11 +993,24 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_fetch_state_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match), );
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_fetch_state_chat_script, bg9x_fetch_state_chat_script_cmds,
-                         abort_matches, modem_cellular_chat_callback_handler, 2);
+                         abort_matches, modem_cellular_chat_callback_handler, 3);
 
-static int bg9x_ssl_update_socket_state(struct bg9x_ssl_modem_data *data)
+static enum bg9x_ssl_modem_socket_state bg9x_ssl_update_socket_state(struct bg9x_ssl_modem_data *data)
 {
-    return modem_run_script_and_wait(data, &bg9x_fetch_state_chat_script);
+    enum bg9x_ssl_modem_socket_state last_state = data->socket_state;
+    if (modem_run_script_and_wait(data, &bg9x_fetch_state_chat_script) < 0)
+    {
+        LOG_ERR("fetch ssl state with qsslstate failed");
+        return SSL_SOCKET_STATE_UNKNWON;
+    }
+
+    // if changed to closing, make sure we close it
+    if (data->socket_state != last_state && data->socket_state == SSL_SOCKET_STATE_CLOSING)
+    {
+        bg9x_ssl_close_socket(data);
+    }
+
+    return data->socket_state;
 }
 
 /*
@@ -1007,7 +1043,7 @@ static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t 
     int transmitted = 0;
     int ret;
 
-    if (data->socket_state != SSL_STATE_CONNECTED)
+    if (data->socket_state != SSL_SOCKET_STATE_CONNECTED)
     {
         LOG_ERR("Socket is not open");
         return -ENOTCONN;
@@ -1028,7 +1064,7 @@ static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t 
     if (transmitted < len)
     {
         LOG_ERR("Failed to transmit all data. transmitted: %d out of %d", transmitted, len);
-        k_sem_reset(&data->script_sem);
+        k_sem_reset(&data->script_event.sem);
         return transmitted;
     }
 
@@ -1036,14 +1072,14 @@ static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t 
     if (ret < 0)
     {
         bg9x_ssl_fetch_error(data);
-        bg9x_ssl_update_socket_state(data);
-        if (data->socket_state != SSL_STATE_CONNECTED)
+        LOG_ERR("Failed to send data: %d. last modem err = %d", ret, data->last_error);
+
+        if (bg9x_ssl_update_socket_state(data) != SSL_SOCKET_STATE_CONNECTED)
         {
             LOG_ERR("Socket diconnected while sending");
-            return -ENOTCONN;
+            return -ECONNRESET;
         }
 
-        LOG_ERR("Failed to send data: %d. last modem err = %d", ret, data->last_error);
         return ret;
     }
 
@@ -1203,21 +1239,27 @@ void pipe_recv_cb(struct modem_pipe *pipe, enum modem_pipe_event event,
                                  sizeof(data->uart_backend_receive_buf) - data->pipe_recv_total);
 
         if (ret < 0)
+        {
             LOG_ERR("Pipe failed to receive data: %d", ret);
+            notify_modem_error(data, RECV_READY, -EIO);
+        }
 
         LOG_DBG("pipe received %d bytes", ret);
         data->pipe_recv_total += ret;
 
         if (is_recv_socket_close(data))
         {
-            LOG_INF("socket closed while reading");
-            notify_modem_event(data, RECV_READY, -ECONNRESET);
+            /* socket closed while reading, this is not an error,
+            some data might have been received and then socket closed,
+            but it still should be handled as a socket close */
+            LOG_DBG("socket closed while reading");
+            notify_modem_success(data, RECV_READY, -ECONNRESET);
             return;
         }
 
         if (is_recv_finished(data))
         {
-            notify_modem_event(data, RECV_READY, 0);
+            notify_modem_success(data, RECV_READY, 0);
             return;
         }
 
@@ -1232,11 +1274,11 @@ static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, 
 {
     int ret;
     char socket_recv_cmd_buf[sizeof("AT+QSSLRECV=##,####")];
-    bool should_close_connection = false;
+    bool connection_reset_occured = false;
     size_t recv_buf_ability = sizeof(data->uart_backend_receive_buf) - strlen("\r\n+QSSLRECV: ####\r\n") - sizeof("\r\n\r\nOK\r\n");
     size_t max_len = requested_size > recv_buf_ability ? recv_buf_ability : requested_size;
 
-    if (data->socket_state != SSL_STATE_CONNECTED)
+    if (data->socket_state != SSL_SOCKET_STATE_CONNECTED)
     {
         LOG_WRN("called recv when socket is not connected");
         return 0;
@@ -1245,19 +1287,20 @@ static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, 
     // This waits on unsolicited command +QSSLURC: "recv"
     if (!data->socket_has_data)
     {
-        k_timeout_t t = data->socket_blocking ? timeout : K_NO_WAIT;
-        ret = wait_on_modem_event(data, RECV_READY, t);
+        ret = wait_on_modem_event(data, RECV_READY, timeout);
         if (ret < 0)
-            return -EAGAIN;
+            return ret;
+
+        data->socket_has_data = true;
     }
 
-    data->socket_has_data = true;
+    // ========= pipe detached mode, must reattach before function exit =========
+    modem_chat_release(&data->chat);
+    modem_pipe_attach(data->uart_pipe, pipe_recv_cb, data);
+
     data->data_to_receive = buf;
     data->data_to_receive_size = max_len;
     data->pipe_recv_total = 0;
-
-    modem_chat_release(&data->chat);
-    modem_pipe_attach(data->uart_pipe, pipe_recv_cb, data);
 
     // send the recv at command with the size of the buffer or the max uart receive buffer
     snprintk(socket_recv_cmd_buf, sizeof(socket_recv_cmd_buf), "AT+QSSLRECV=1,%d\r", max_len);
@@ -1271,10 +1314,14 @@ static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, 
         goto exit;
     }
 
-    // wait for reading until ending "/r/n/r/nOK/r/n" or socket closed
-    ret = wait_on_modem_event(data, RECV_READY, timeout);
+    // it is safe to wait on this event again. +QSSLURC: "recv" can't arrive while pipe detached
+    // also we must give some timeout here, to be able to read the buffer..
+    ret = wait_on_modem_event(data, RECV_READY, K_SECONDS(10));
+
+    // if connection was reset mid recv, we should close the connection after attaching back the chat
+    // but we can still handle the data received first
     if (ret == -ECONNRESET)
-        should_close_connection = true;
+        connection_reset_occured = true;
     else if (ret < 0)
         goto exit;
 
@@ -1282,11 +1329,6 @@ static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, 
     if (ret < 0)
     {
         LOG_ERR("Failed to parse and extract recv data: %d", ret);
-
-        // parse failed and connection closed -> connection was reset mid recv
-        if (should_close_connection)
-            ret = -ECONNRESET;
-
         goto exit;
     }
 
@@ -1301,26 +1343,9 @@ static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, 
 exit:
     modem_pipe_release(data->uart_pipe);
     modem_chat_attach(&data->chat, data->uart_pipe);
-    k_sem_reset(&data->recv_sem);
 
-    if (should_close_connection)
+    if (connection_reset_occured)
         bg9x_ssl_close_socket(data);
-
-    return ret;
-}
-
-int bg9x_ssl_modem_interface_start(struct bg9x_ssl_modem_data *data)
-{
-    int ret;
-
-    ret = bg9x_ssl_configure(data);
-    if (ret < 0)
-    {
-        LOG_ERR("Failed to configure modem: %d", ret);
-        return ret;
-    }
-
-    ret = bg9x_ssl_modem_start(data);
 
     return ret;
 }
@@ -1331,6 +1356,24 @@ int bg9x_ssl_modem_interface_start(struct bg9x_ssl_modem_data *data)
  * =======================================================================
  * ========================================================================
  */
+
+int bg9x_ssl_modem_interface_start(struct bg9x_ssl_modem_data *data)
+{
+    int ret;
+
+    // configure files, ssl config
+    ret = bg9x_ssl_configure(data);
+    if (ret < 0)
+    {
+        LOG_ERR("Failed to configure modem: %d", ret);
+        return ret;
+    }
+
+    // register to network and activate ssl context
+    ret = bg9x_ssl_modem_start(data);
+
+    return ret;
+}
 
 static int offload_connect(void *obj, const struct sockaddr *addr, socklen_t addrlen)
 {
@@ -1387,14 +1430,11 @@ static ssize_t offload_recvfrom(void *obj, void *buf, size_t len,
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)obj;
 
     int ret;
+    k_timeout_t timeout = data->socket_blocking ? K_FOREVER : K_NO_WAIT;
 
-    // TODO: check that socket source matches the source in the socket (received in offload_connect)
-
-    ret = bg9x_ssl_socket_recv(data, (uint8_t *)buf, len, K_FOREVER);
+    ret = bg9x_ssl_socket_recv(data, (uint8_t *)buf, len, timeout);
     if (ret < 0)
-    {
         errno = -ret;
-    }
 
     return ret;
 }
@@ -1411,11 +1451,15 @@ static ssize_t offload_sendto(void *obj, const void *buf, size_t len,
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)obj;
     int ret;
 
+    if (flags)
+    {
+        LOG_ERR("ignoring send flags 0x%x", flags);
+    }
+
     ret = bg9x_ssl_socket_send(data, (const uint8_t *)buf, len);
     if (ret < 0)
     {
         errno = -ret;
-        LOG_ERR("Failed to send data");
     }
 
     return ret;
@@ -1423,7 +1467,7 @@ static ssize_t offload_sendto(void *obj, const void *buf, size_t len,
 
 static ssize_t offload_sendmsg(void *obj, const struct msghdr *msg, int flags)
 {
-    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)obj;
+    // struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)obj;
     ssize_t sent = 0;
     int rc;
 
@@ -1440,22 +1484,24 @@ static ssize_t offload_sendmsg(void *obj, const struct msghdr *msg, int flags)
                                 msg->msg_name, msg->msg_namelen);
             if (rc < 0)
             {
-                if (data->socket_blocking == false)
-                {
-                    errno = -rc;
-                    return rc;
-                }
+                errno = -rc;
+                return rc;
+                // if (data->socket_blocking == false)
+                // {
+                //     errno = -rc;
+                //     return rc;
+                // }
 
-                if (rc == -EAGAIN)
-                {
-                    k_sleep(K_MSEC(200));
-                }
+                // if (rc == -EAGAIN)
+                // {
+                //     k_sleep(K_MSEC(200));
+                // }
 
-                else
-                {
-                    sent = rc;
-                    break;
-                }
+                // else
+                // {
+                //     sent = rc;
+                //     break;
+                // }
             }
             else
             {
@@ -1478,6 +1524,8 @@ int bg9x_ssl_getaddrinfo(const char *node, const char *service,
                          const struct zsock_addrinfo *hints,
                          struct zsock_addrinfo **res)
 {
+    int ret;
+
     if (node == NULL || res == NULL)
     {
         LOG_ERR("Invalid arguments");
@@ -1491,7 +1539,11 @@ int bg9x_ssl_getaddrinfo(const char *node, const char *service,
         return -ENOTSUP;
     }
 
-    return bg9x_ssl_dns_resolve(&modem_data, node, res);
+    ret = bg9x_ssl_dns_resolve(&modem_data, node, res);
+    if (ret < 0)
+        errno = -ret;
+
+    return ret;
 }
 
 void bg9x_ssl_freeaddrinfo(struct zsock_addrinfo *res)
@@ -1500,8 +1552,6 @@ void bg9x_ssl_freeaddrinfo(struct zsock_addrinfo *res)
     {
         return;
     }
-
-    __ASSERT(res == modem_data.last_resolved_addr_info, "Invalid addrinfo! must be last resolved addrinfo");
 
     while (res != NULL)
     {
@@ -1512,7 +1562,7 @@ void bg9x_ssl_freeaddrinfo(struct zsock_addrinfo *res)
     }
 
     modem_data.last_resolved_addr_info = NULL;
-    modem_data.resolved_addr_count = 0;
+    modem_data.expected_addr_count = 0;
 }
 
 int ioctl_poll_prepare(struct bg9x_ssl_modem_data *data, struct zsock_pollfd *pfd, struct k_poll_event **pev,
@@ -1669,13 +1719,13 @@ int bg9x_ssl_modem_power_on(const struct device *dev)
     if (modem_pipe_open(data->uart_pipe) < 0)
     {
         LOG_ERR("Failed to open UART pipe");
-        return -EAGAIN;
+        return -EIO;
     }
 
     if (modem_chat_attach(&data->chat, data->uart_pipe) < 0)
     {
         LOG_ERR("Failed to attach chat to uart");
-        return -EAGAIN;
+        return -EIO;
     }
 
     LOG_INF("Powering on modem");
@@ -1739,12 +1789,14 @@ static int bg9x_ssl_init(const struct device *dev)
     data->client_key = sizeof(client_key_default) > 0 ? client_key_default : NULL;
 #endif
 
+    data->socket_has_data = false;
     data->socket_blocking = true;
-    data->socket_state = SSL_STATE_INITIAL;
+    data->socket_state = SSL_SOCKET_STATE_INITIAL;
 
-    k_sem_init(&data->script_sem, 0, 1);
-    k_sem_init(&data->registration_sem, 0, 1);
-    k_sem_init(&data->recv_sem, 0, 1);
+    k_sem_init(&data->script_event.sem, 0, 1);
+    k_sem_init(&data->registration_event.sem, 0, 1);
+    k_sem_init(&data->recv_event.sem, 0, 1);
+    k_sem_init(&data->getaddr_event.sem, 0, 1);
     k_poll_signal_init(&data->sig_data_ready);
 
     // init uart backend
