@@ -1016,7 +1016,7 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_fetch_state_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match), );
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_fetch_state_chat_script, bg9x_fetch_state_chat_script_cmds,
-                         abort_matches, bg9x_ssl_chat_callback_handler, 3);
+                         abort_matches, bg9x_ssl_chat_callback_handler, 2);
 
 static enum bg9x_ssl_modem_socket_state bg9x_ssl_update_socket_state(struct bg9x_ssl_modem_data *data)
 {
@@ -1215,7 +1215,7 @@ bool is_recv_finished(struct bg9x_ssl_modem_data *data)
     size_t size = data->pipe_recv_total;
     const char *buf = data->data_to_receive;
 
-    if (size < ((sizeof("\r\n\r\nOK\r\n") - 1) + sizeof("\r\n+QSSLRECV: #\r\n")))
+    if (size < ((strlen("\r\n\r\nOK\r\n")) + strlen("\r\n+QSSLRECV: #")))
         return false;
 
     const char *read_end = memmem(buf, size, "\r\n\r\nOK\r\n", strlen("\r\n\r\nOK\r\n"));
@@ -1489,7 +1489,6 @@ static int offload_connect(void *obj, const struct sockaddr *addr, socklen_t add
 
     k_mutex_lock(&data->modem_mutex, K_FOREVER);
 
-    // bg9x_ssl_update_socket_state(data);
     ret = bg9x_ssl_open_socket(data, ip, port);
     if (ret != 0)
     {
@@ -1557,6 +1556,7 @@ static ssize_t offload_sendto(void *obj, const void *buf, size_t len,
     }
 
     k_mutex_lock(&data->modem_mutex, K_FOREVER);
+
     ret = bg9x_ssl_socket_send(data, (const uint8_t *)buf, len);
     if (ret < 0)
     {
