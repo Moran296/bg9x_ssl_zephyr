@@ -49,8 +49,7 @@ uint8_t client_key_default[] = {
 enum bg9x_ssl_modem_events
 {
     MODEM_EVENT_SCRIPT,
-    MODEM_EVENT_REGISTERED,
-    MODEM_EVENT_RECV_READY,
+    MODEM_EVENT_UNSOL,
 };
 
 enum bg9x_ssl_modem_script_events
@@ -66,9 +65,15 @@ enum bg9x_ssl_modem_script_events
     // RECV related
     SCRIPT_RECV_STATE_FINISHED = 3,
     SCRIPT_RECV_STATE_CONN_CLOSED = 4,
-    // GETADDR related
-    SCRIPT_GETADDR_STATE_RESOLVE_FINISHED = 5,
 
+};
+
+enum bg9x_ssl_modem_unsol_events
+{
+    UNSOL_EVENT_REGISTERED = 1,
+    UNSOL_EVENT_GETADDR_RESOLVE_FINISHED = 3,
+    // UNSOL_EVENT_SOCKET_CLOSED = 3,
+    // UNSOL_EVENT_SOCKET_RECV = 4,
 };
 
 enum bg9x_ssl_modem_socket_state
@@ -137,7 +142,6 @@ struct bg9x_ssl_modem_data
     uint8_t registration_status_gsm;
     uint8_t registration_status_gprs;
     uint8_t registration_status_lte;
-    struct modem_event registration_event;
 
     // certs
     const uint8_t *ca_cert;
@@ -153,7 +157,7 @@ struct bg9x_ssl_modem_data
     enum bg9x_ssl_modem_socket_state socket_state;
     bool socket_blocking;
     struct modem_event script_event;
-    struct modem_event recv_event;
+    struct modem_event unsol_event;
 
     /** data ready poll signal */
     struct k_poll_signal sig_data_ready;
@@ -169,7 +173,6 @@ struct bg9x_ssl_modem_data
     // dns
     struct zsock_addrinfo *last_resolved_addr_info;
     int expected_addr_count;
-    struct modem_event getaddr_event;
 };
 
 extern char *strnstr(const char *haystack, const char *needle, size_t haystack_sz);
@@ -212,10 +215,8 @@ static struct modem_event *get_modem_event(struct bg9x_ssl_modem_data *data, enu
     {
     case MODEM_EVENT_SCRIPT:
         return &data->script_event;
-    case MODEM_EVENT_REGISTERED:
-        return &data->registration_event;
-    case MODEM_EVENT_RECV_READY:
-        return &data->recv_event;
+    case MODEM_EVENT_UNSOL:
+        return &data->unsol_event;
     default:
         return NULL;
     }
@@ -327,7 +328,7 @@ static void on_cxreg_match_cb(struct modem_chat *chat, char **argv, uint16_t arg
 
     if (modem_cellular_is_registered(data))
     {
-        notify_modem_success(data, MODEM_EVENT_REGISTERED, 0);
+        notify_modem_success(data, MODEM_EVENT_UNSOL, UNSOL_EVENT_REGISTERED);
         LOG_INF("Modem registered");
     }
     else
@@ -684,7 +685,7 @@ static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t 
 
         if (address_count == data->expected_addr_count)
         {
-            notify_modem_success(data, MODEM_EVENT_SCRIPT, SCRIPT_GETADDR_STATE_RESOLVE_FINISHED);
+            notify_modem_success(data, MODEM_EVENT_UNSOL, UNSOL_EVENT_GETADDR_RESOLVE_FINISHED);
         }
     }
 
@@ -696,7 +697,7 @@ static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t 
         if (ret != 0)
         {
             LOG_ERR("DNS resolve failed: %d", ret);
-            notify_modem_error(data, MODEM_EVENT_SCRIPT, SCRIPT_STATE_ERROR);
+            notify_modem_error(data, MODEM_EVENT_UNSOL, -EIO);
             return;
         }
 
@@ -704,7 +705,7 @@ static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t 
         if (expected_addresses <= 0)
         {
             LOG_ERR("Invalid DNS address count: %d", expected_addresses);
-            notify_modem_error(data, MODEM_EVENT_SCRIPT, SCRIPT_STATE_UNKNOWN);
+            notify_modem_error(data, MODEM_EVENT_UNSOL, -EINVAL);
             return;
         }
 
@@ -723,7 +724,7 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_resolve_dns_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP(dns_resolve_cmd_buf, ok_match));
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_resolve_dns_chat_script, bg9x_ssl_resolve_dns_chat_script_cmds,
-                         abort_matches, NULL, 5);
+                         abort_matches, bg9x_ssl_chat_callback_handler, 5);
 
 // This currently only resolves one address into a buffer.
 static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *host_req, struct zsock_addrinfo **resp)
@@ -739,15 +740,15 @@ static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *ho
     data->last_resolved_addr_info = NULL;
     data->expected_addr_count = 0;
 
-    // create request and run, don't wait on it. wait for unsolicited dnsgip instead
+    // create request and run
     snprintk(dns_resolve_cmd_buf, sizeof(dns_resolve_cmd_buf), "AT+QIDNSGIP=1,\"%s\"", host_req);
-    ret = modem_chat_script_run(&data->chat, &bg9x_ssl_resolve_dns_chat_script);
-    if (ret < 0)
+    ret = modem_run_script_and_wait(data, &bg9x_ssl_resolve_dns_chat_script);
+    if (ret != 0)
         return ret;
 
     // wait for all addresses to be resolved
-    ret = wait_on_modem_event(data, MODEM_EVENT_SCRIPT, K_SECONDS(60));
-    if (ret != SCRIPT_GETADDR_STATE_RESOLVE_FINISHED)
+    ret = wait_on_modem_event(data, MODEM_EVENT_UNSOL, K_SECONDS(60));
+    if (ret != UNSOL_EVENT_GETADDR_RESOLVE_FINISHED)
     {
         LOG_ERR("getaddr expected resolve finished event but got %d", ret);
         return ret < 0 ? ret : -EIO;
@@ -837,9 +838,9 @@ static int bg9x_ssl_modem_start(struct bg9x_ssl_modem_data *data)
         return ret;
 
     // wait for registration
-    ret = wait_on_modem_event(data, MODEM_EVENT_REGISTERED, K_SECONDS(60));
-    if (ret != 0)
-        LOG_ERR("Modem did not register in time");
+    ret = wait_on_modem_event(data, MODEM_EVENT_UNSOL, K_SECONDS(60));
+    if (ret != UNSOL_EVENT_REGISTERED)
+        LOG_ERR("Modem did not register in time. expected registered event but got %d", ret);
 
     return ret;
 }
@@ -1902,9 +1903,7 @@ static int bg9x_ssl_init(const struct device *dev)
 
     k_mutex_init(&data->modem_mutex);
     k_sem_init(&data->script_event.sem, 0, 1);
-    k_sem_init(&data->registration_event.sem, 0, 1);
-    k_sem_init(&data->recv_event.sem, 0, 1);
-    k_sem_init(&data->getaddr_event.sem, 0, 1);
+    k_sem_init(&data->unsol_event.sem, 0, 1);
     k_poll_signal_init(&data->sig_data_ready);
 
     // init uart backend
