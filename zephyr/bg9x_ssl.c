@@ -152,7 +152,6 @@ struct bg9x_ssl_modem_data
     int fd;
     enum bg9x_ssl_modem_socket_state socket_state;
     bool socket_blocking;
-    bool socket_has_data;
     struct modem_event script_event;
     struct modem_event recv_event;
 
@@ -402,7 +401,13 @@ static void unsol_closed_match_cb(struct modem_chat *chat, char **argv, uint16_t
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
 
     LOG_INF("QSSLURC: closed -> update_socket_state");
+    if (k_mutex_lock(&data->modem_mutex, K_SECONDS(1)) != 0)
+    {
+        LOG_ERR("failed to lock modem mutex, closing socket anyway");
+    }
+
     bg9x_ssl_close_socket(data);
+    k_mutex_unlock(&data->modem_mutex);
 }
 
 static void unsol_recv_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
@@ -411,7 +416,6 @@ static void unsol_recv_match_cb(struct modem_chat *chat, char **argv, uint16_t a
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
 
     LOG_INF("QSSLURC: recv -> signal data ready");
-    notify_modem_success(data, MODEM_EVENT_RECV_READY, 0);
     k_poll_signal_raise(&data->sig_data_ready, 0);
 }
 
@@ -921,19 +925,11 @@ static void socket_cleanup(struct bg9x_ssl_modem_data *data)
     data->fd = -1;
 }
 
-static void close_socket_chat_callback_handler(struct modem_chat *chat,
-                                               enum modem_chat_script_result result,
-                                               void *user_data)
-{
-    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
-    data->socket_state = SSL_SOCKET_STATE_INITIAL;
-}
-
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_close_socket_chat_script_cmds,
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCLOSE=1,0", ok_match), );
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCLOSE=1,3", ok_match), );
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_close_socket_chat_script, bg9x_close_socket_chat_script_cmds,
-                         abort_matches, close_socket_chat_callback_handler, 5);
+                         abort_matches, bg9x_ssl_chat_callback_handler, 5);
 
 static int bg9x_ssl_close_socket(struct bg9x_ssl_modem_data *data)
 {
@@ -944,7 +940,7 @@ static int bg9x_ssl_close_socket(struct bg9x_ssl_modem_data *data)
     }
 
     socket_cleanup(data);
-    return modem_chat_script_run(&data->chat, &bg9x_close_socket_chat_script);
+    return modem_run_script_and_wait(data, &bg9x_close_socket_chat_script);
 }
 
 /*
@@ -1365,17 +1361,6 @@ static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, 
         return 0;
     }
 
-    // This waits on unsolicited command +QSSLURC: "recv"
-    if (!data->socket_has_data)
-    {
-        // if socket is blocking, expect timeout to be 0
-        ret = wait_on_modem_event(data, MODEM_EVENT_RECV_READY, timeout);
-        if (ret < 0)
-            return -EAGAIN;
-
-        data->socket_has_data = true;
-    }
-
     // ========= pipe detached mode, must reattach before function exit =========
     modem_chat_release(&data->chat);
     modem_pipe_attach(data->uart_pipe, pipe_recv_cb, data);
@@ -1422,7 +1407,6 @@ static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, 
     // if parsed correctly but no data available, handle accordingly
     if (ret == 0)
     {
-        data->socket_has_data = false;
         k_poll_signal_reset(&data->sig_data_ready);
         if (data->socket_blocking == false)
             ret = -EAGAIN;
@@ -1435,7 +1419,6 @@ exit:
 
     if (connection_reset_occured)
     {
-        data->socket_has_data = false;
         bg9x_ssl_close_socket(data);
     }
 
@@ -1508,11 +1491,6 @@ static int offload_close(void *obj)
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)obj;
 
     k_mutex_lock(&data->modem_mutex, K_FOREVER);
-    if (data->fd > 0)
-    {
-        z_free_fd(data->fd);
-        data->fd = -1;
-    }
 
     int ret = bg9x_ssl_close_socket(data);
     errno = -ret;
@@ -1906,7 +1884,6 @@ static int bg9x_ssl_init(const struct device *dev)
 #endif
 
     data->socket_blocking = true;
-    data->socket_has_data = false;
     data->socket_state = SSL_SOCKET_STATE_INITIAL;
 
     k_mutex_init(&data->modem_mutex);
