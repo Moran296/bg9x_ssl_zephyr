@@ -1807,28 +1807,54 @@ int bg9x_ssl_modem_power_on(const struct device *dev)
 
 int bg9x_ssl_modem_power_off(const struct device *dev)
 {
-    // TODO
+    struct bg9x_ssl_modem_config *config = (struct bg9x_ssl_modem_config *)dev->config;
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)dev->data;
+
+    if (data->socket_state != SSL_SOCKET_STATE_INITIAL)
+    {
+        LOG_DBG("modem power off: first trying to gracefully close socket");
+        bg9x_ssl_close_socket(data);
+    }
+
+    modem_chat_release(&data->chat);
+    modem_pipe_close(data->uart_pipe);
+
+    LOG_INF("Powering off modem");
+    gpio_pin_set_dt(&config->power_gpio, 1);
+    k_sleep(K_MSEC(config->power_pulse_duration_ms));
+
+    gpio_pin_set_dt(&config->power_gpio, 0);
+    k_sleep(K_MSEC(config->shutdown_time_ms));
+
     return 0;
 }
 
 static int bg9x_ssl_pm_action(const struct device *dev, enum pm_device_action action)
 {
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)dev->data;
+    int ret;
+
+    k_mutex_lock(&data->modem_mutex, K_FOREVER);
+
     switch (action)
     {
     case PM_DEVICE_ACTION_RESUME:
 
-        return bg9x_ssl_modem_power_on(dev);
+        ret = bg9x_ssl_modem_power_on(dev);
         break;
 
     case PM_DEVICE_ACTION_SUSPEND:
 
-        return bg9x_ssl_modem_power_off(dev);
+        ret = bg9x_ssl_modem_power_off(dev);
         break;
 
     default:
-        return -ENOTSUP;
+        ret = -ENOTSUP;
         break;
     }
+
+    k_mutex_unlock(&data->modem_mutex);
+    return ret;
 }
 
 /* =========================== Device Init ============================================= */
