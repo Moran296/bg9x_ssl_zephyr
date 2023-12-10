@@ -59,9 +59,6 @@ enum bg9x_ssl_modem_script_events
     SCRIPT_STATE_ERROR = -EIO,
     SCRIPT_STATE_TIMEOUT = -ETIMEDOUT,
     SCRIPT_STATE_SUCCESS = 0,
-    // SEND related
-    SCRIPT_SEND_STATE_PROMPT = 1,
-    SCRIPT_SEND_STATE_FINISHED = 2,
     // RECV related
     SCRIPT_RECV_STATE_FINISHED = 3,
     SCRIPT_RECV_STATE_CONN_CLOSED = 4,
@@ -1046,7 +1043,7 @@ static void send_success_match_cb(struct modem_chat *chat, char **argv, uint16_t
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
     LOG_DBG("Send OK");
-    notify_modem_success(data, MODEM_EVENT_SCRIPT, 0);
+    notify_modem_success(data, MODEM_EVENT_SCRIPT, SCRIPT_STATE_SUCCESS);
 }
 
 static void send_fail_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
@@ -1113,8 +1110,8 @@ static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t 
         return ret;
     }
 
-    // sleep to allow modem to open prompt... TODO: find a better way
-    k_sleep(K_MSEC(250));
+    // sleep to allow modem to open prompt...
+    k_sleep(K_MSEC(150));
 
     // transmit data in chunks until len
     transmitted = modem_transmit_data(data, buf, len);
@@ -1123,7 +1120,7 @@ static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t 
 
     // wait for modem send result (SEND OK / SEND FAIL / ERROR)
     ret = wait_on_modem_event(data, MODEM_EVENT_SCRIPT, K_FOREVER);
-    if (ret < 0)
+    if (ret < SCRIPT_STATE_SUCCESS)
     {
         LOG_DBG("send script failed: %d", ret);
         return ret;
