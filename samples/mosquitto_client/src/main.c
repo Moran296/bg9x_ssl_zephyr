@@ -20,12 +20,19 @@
 LOG_MODULE_REGISTER(MAIN);
 
 #define SERVER_HOST "test.mosquitto.org"
-#define SERVER_PORT 8883
 #define APP_CONNECT_TIMEOUT_MS 2000
 #define APP_SLEEP_MSECS 500
 #define APP_CONNECT_TRIES 10
 #define APP_MQTT_BUFFER_SIZE 128
 #define MQTT_CLIENTID "zephyr_publisher"
+
+#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL == 2
+#define SERVER_PORT 8884
+#elif CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL == 1
+#define SERVER_PORT 8883
+#else
+#define SERVER_PORT 1883
+#endif
 
 static const struct device *modem = DEVICE_DT_GET(DT_ALIAS(modem));
 static struct gpio_dt_spec modem_enable = GPIO_DT_SPEC_GET(DT_ALIAS(modem_enable), gpios);

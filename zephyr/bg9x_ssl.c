@@ -527,12 +527,12 @@ static int bg9x_ssl_write_files(struct bg9x_ssl_modem_data *data)
         }
 
         // nullify so will not reupload next connection
-        data->client_cert = NULL
+        data->client_cert = NULL;
     }
 
     if (data->client_key != NULL)
     {
-        size = data->client_key == client_key_default ? sizeof(client_key_default) : strlen(data->key_cert);
+        size = data->client_key == client_key_default ? sizeof(client_key_default) : strlen(data->client_key);
         ret = write_modem_file(data, CLIENT_KEY_FILE_NAME, data->client_key, size);
         if (ret != 0)
         {
@@ -884,7 +884,7 @@ static int bg9x_ssl_open_socket(struct bg9x_ssl_modem_data *data, const char *ip
         return -EISCONN;
     }
 
-    snprintk(socket_open_cmd_buf, sizeof(socket_open_cmd_buf), "AT+QSSLOPEN=1,0,1,\"%s\",%d,%d", ip, port, QUECTEL_BUFFER_ACCESS_MODE);
+    snprintk(socket_open_cmd_buf, sizeof(socket_open_cmd_buf), "AT+QSSLOPEN=1,1,1,\"%s\",%d,%d", ip, port, QUECTEL_BUFFER_ACCESS_MODE);
     ret = modem_run_script_and_wait(data, &bg9x_open_socket_chat_script);
     if (ret != MODEM_CHAT_SCRIPT_RESULT_SUCCESS)
     {
