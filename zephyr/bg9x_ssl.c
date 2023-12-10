@@ -28,15 +28,15 @@ LOG_MODULE_REGISTER(modem_quectel_bg9x_ssl, CONFIG_MODEM_LOG_LEVEL);
 #define CA_FILE_NAME "ca_file"
 #define CLIENT_CERT_FILE_NAME "cl_c_file"
 #define CLIENT_KEY_FILE_NAME "cl_k_file"
-#define SECLEVEL STRINGIFY(CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL)
+#define SECLEVEL STRINGIFY(CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL)
 
-#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 0
+#if CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL > 0
 uint8_t ca_cert_default[] = {
 #include "bg95_ssl_ca_cert.inc"
 };
 #endif
 
-#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 1
+#if CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL > 1
 uint8_t client_cert_default[] = {
 #include "bg95_ssl_client_cert.inc"
 };
@@ -496,7 +496,7 @@ static int write_modem_file(struct bg9x_ssl_modem_data *data, const char *name, 
 static int bg9x_ssl_write_files(struct bg9x_ssl_modem_data *data)
 {
 
-#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 0
+#if CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL > 0
     int ret;
     size_t size;
 
@@ -515,7 +515,7 @@ static int bg9x_ssl_write_files(struct bg9x_ssl_modem_data *data)
     }
 #endif
 
-#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 1
+#if CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL > 1
     if (data->client_cert != NULL)
     {
         size = data->client_cert == client_cert_default ? sizeof(client_cert_default) : strlen(data->client_cert);
@@ -775,10 +775,10 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_configure_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"negotiatetime\",1,300", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"ignorelocaltime\",1,1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"seclevel\",1," SECLEVEL, ok_match),
-#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 0
+#if CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL > 0
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"cacert\",1,\"" CA_FILE_NAME "\"", ok_match),
 #endif
-#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 1
+#if CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL > 1
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"clientcert\",1,\"" CLIENT_CERT_FILE_NAME "\"", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"clientkey\",1,\"" CLIENT_KEY_FILE_NAME "\"", ok_match),
 #endif
@@ -796,7 +796,7 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_register_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG=1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGREG?", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG?", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QICSGP=1,1,\"" CONFIG_BG9X_MODEM_SSL_APN "\",\"\",\"\",3", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QICSGP=1,1,\"" CONFIG_BG9X_SSL_MODEM_APN "\",\"\",\"\",3", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGPADDR=1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QIACT=1", ok_match), );
 
@@ -1840,10 +1840,10 @@ static int bg9x_ssl_init(const struct device *dev)
 
     gpio_pin_configure_dt(&config->power_gpio, GPIO_OUTPUT_INACTIVE);
 
-#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 0
+#if CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL > 0
     data->ca_cert = sizeof(ca_cert_default) > 0 ? ca_cert_default : NULL;
 #endif
-#if CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL > 1
+#if CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL > 1
     data->client_cert = sizeof(client_cert_default) > 0 ? client_cert_default : NULL;
     data->client_key = sizeof(client_key_default) > 0 ? client_key_default : NULL;
 #endif
@@ -1905,7 +1905,7 @@ static bool offload_is_supported(int family, int type, int proto)
     if (type != SOCK_STREAM)
         return false;
 
-    if (CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL == 0)
+    if (CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL == 0)
         return proto == IPPROTO_TCP;
 
     // support these tls versions. determined with AT+QSSLCFG="sslversion",4 == (TLS 1.0) | (TLS 1.1) | (TLS 1.2)

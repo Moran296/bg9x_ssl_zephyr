@@ -47,4 +47,4 @@ devicetree node:
    };
 
 Next, the UART API must be specified using ``CONFIG_UART_ASYNC_API=y``. The driver doesn't support UART polling.
-Lastly, the APN must be configured using ``BG9X_MODEM_SSL_APN=""``.
+Lastly, the APN must be configured using ``BG9X_SSL_MODEM_APN=""``.

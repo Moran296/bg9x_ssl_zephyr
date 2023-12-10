@@ -31,13 +31,13 @@ endfunction()
 # We raise an error if the CA cert is specified but not found (at the base project cmakelists.txt directory)
 # Do the same for the client cert and key files if the security level is 2
 
-if(${CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL} GREATER_EQUAL 1)
-    generate_cert_file(CONFIG_BG9X_MODEM_SSL_CA_CERT "bg95_ssl_ca_cert")
+if(${CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL} GREATER_EQUAL 1)
+    generate_cert_file(CONFIG_BG9X_SSL_MODEM_CA_CERT "bg95_ssl_ca_cert")
 endif()
 
-if(${CONFIG_BG9X_MODEM_SSL_SECURITY_LEVEL} GREATER_EQUAL 2)
-    generate_cert_file(CONFIG_BG9X_MODEM_SSL_CLIENT_CERT "bg95_ssl_client_cert")
-    generate_cert_file(CONFIG_BG9X_MODEM_SSL_CLIENT_KEY "bg95_ssl_client_key")
+if(${CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL} GREATER_EQUAL 2)
+    generate_cert_file(CONFIG_BG9X_SSL_MODEM_CLIENT_CERT "bg95_ssl_client_cert")
+    generate_cert_file(CONFIG_BG9X_SSL_MODEM_CLIENT_KEY "bg95_ssl_client_key")
 endif()
 
 
