@@ -73,7 +73,7 @@ enum bg9x_ssl_modem_script_events
 
 enum bg9x_ssl_modem_socket_state
 {
-    SSL_SOCKET_STATE_UNKNWON = -1,
+    SSL_SOCKET_STATE_UNKNOWN = -1,
     SSL_SOCKET_STATE_INITIAL = 0,
     SSL_SOCKET_STATE_OPENING = 1,
     SSL_SOCKET_STATE_CONNECTED = 2,
@@ -723,7 +723,7 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_resolve_dns_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP(dns_resolve_cmd_buf, ok_match));
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_resolve_dns_chat_script, bg9x_ssl_resolve_dns_chat_script_cmds,
-                         abort_matches, bg9x_ssl_chat_callback_handler, 5);
+                         abort_matches, NULL, 5);
 
 // This currently only resolves one address into a buffer.
 static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *host_req, struct zsock_addrinfo **resp)
@@ -736,10 +736,13 @@ static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *ho
         return -EINVAL;
     }
 
-    // create request and run
+    data->last_resolved_addr_info = NULL;
+    data->expected_addr_count = 0;
+
+    // create request and run, don't wait on it. wait for unsolicited dnsgip instead
     snprintk(dns_resolve_cmd_buf, sizeof(dns_resolve_cmd_buf), "AT+QIDNSGIP=1,\"%s\"", host_req);
-    ret = modem_run_script_and_wait(data, &bg9x_ssl_resolve_dns_chat_script);
-    if (ret != SCRIPT_STATE_SUCCESS)
+    ret = modem_chat_script_run(&data->chat, &bg9x_ssl_resolve_dns_chat_script);
+    if (ret < 0)
         return ret;
 
     // wait for all addresses to be resolved
@@ -926,13 +929,14 @@ static void socket_cleanup(struct bg9x_ssl_modem_data *data)
 }
 
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_close_socket_chat_script_cmds,
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCLOSE=1,3", ok_match), );
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCLOSE=1,0", ok_match), );
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_close_socket_chat_script, bg9x_close_socket_chat_script_cmds,
-                         abort_matches, bg9x_ssl_chat_callback_handler, 5);
+                         abort_matches, bg9x_ssl_chat_callback_handler, 10);
 
 static int bg9x_ssl_close_socket(struct bg9x_ssl_modem_data *data)
 {
+    int ret;
     if (data->socket_state == SSL_SOCKET_STATE_INITIAL)
     {
         LOG_DBG("Socket already closed");
@@ -940,7 +944,17 @@ static int bg9x_ssl_close_socket(struct bg9x_ssl_modem_data *data)
     }
 
     socket_cleanup(data);
-    return modem_run_script_and_wait(data, &bg9x_close_socket_chat_script);
+
+    ret = modem_run_script_and_wait(data, &bg9x_close_socket_chat_script);
+    if (ret != MODEM_CHAT_SCRIPT_RESULT_SUCCESS)
+    {
+        LOG_ERR("Failed to close socket: %d", ret);
+        data->socket_state = SSL_SOCKET_STATE_UNKNOWN;
+        return -EIO;
+    }
+
+    data->socket_state = SSL_SOCKET_STATE_INITIAL;
+    return 0;
 }
 
 /*
@@ -1010,7 +1024,7 @@ static enum bg9x_ssl_modem_socket_state bg9x_ssl_update_socket_state(struct bg9x
     if (ret != MODEM_CHAT_SCRIPT_RESULT_SUCCESS)
     {
         LOG_ERR("fetch ssl state with qsslstate failed: %d", ret);
-        return SSL_SOCKET_STATE_UNKNWON;
+        return SSL_SOCKET_STATE_UNKNOWN;
     }
 
     // if changed to closing, make sure we close it
