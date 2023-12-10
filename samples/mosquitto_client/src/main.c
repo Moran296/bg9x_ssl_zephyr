@@ -349,7 +349,7 @@ static int publisher(void)
 	SUCCESS_OR_EXIT(rc);
 
 	i = 0;
-	while (i++ < 500 && connected)
+	while (i++ < 10 && connected)
 	{
 		r = -1;
 
@@ -387,27 +387,37 @@ static int publisher(void)
 	rc = mqtt_disconnect(&client_ctx);
 	PRINT_RESULT("mqtt_disconnect", rc);
 
-	LOG_INF("Bye!");
-
 	return r;
 }
 
 static int start_app(void)
 {
-	int r = 0, i = 0;
 
-	while (!0 ||
-		   i++ < 0)
+	int ret;
+
+	LOG_INF("Powering on modem");
+	ret = pm_device_action_run(modem, PM_DEVICE_ACTION_RESUME);
+	if (ret < 0)
 	{
-		r = publisher();
-
-		if (!0)
-		{
-			k_sleep(K_MSEC(5000));
-		}
+		LOG_ERR("Failed to power up modem: %d", ret);
+		return -1;
 	}
 
-	return r;
+	ret = publisher();
+	PRINT_RESULT("publisher returned", ret);
+
+	LOG_INF("Powering off modem");
+	ret = pm_device_action_run(modem, PM_DEVICE_ACTION_SUSPEND);
+	if (ret < 0)
+	{
+		LOG_ERR("Failed to power off modem: %d", ret);
+		return -1;
+	}
+
+	LOG_INF("Bye!");
+	k_sleep(K_SECONDS(3));
+
+	return ret;
 }
 
 int main(void)
@@ -416,14 +426,6 @@ int main(void)
 	gpio_pin_configure_dt(&modem_enable, GPIO_OUTPUT);
 	gpio_pin_set_dt(&modem_enable, 1);
 	k_sleep(K_SECONDS(3));
-
-	printk("Powering on modem\n");
-	int ret = pm_device_action_run(modem, PM_DEVICE_ACTION_RESUME);
-	if (ret < 0)
-	{
-		printk("Failed to power up modem: %d\n", ret);
-		return -1;
-	}
 
 	exit(start_app());
 	return 0;
