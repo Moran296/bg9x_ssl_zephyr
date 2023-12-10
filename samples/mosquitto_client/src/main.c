@@ -35,7 +35,6 @@ LOG_MODULE_REGISTER(MAIN);
 #endif
 
 static const struct device *modem = DEVICE_DT_GET(DT_ALIAS(modem));
-static struct gpio_dt_spec modem_enable = GPIO_DT_SPEC_GET(DT_ALIAS(modem_enable), gpios);
 
 static uint8_t rx_buffer[APP_MQTT_BUFFER_SIZE];
 static uint8_t tx_buffer[APP_MQTT_BUFFER_SIZE];
@@ -422,10 +421,6 @@ static int start_app(void)
 
 int main(void)
 {
-	printk("Powering on modem enable pin\n");
-	gpio_pin_configure_dt(&modem_enable, GPIO_OUTPUT);
-	gpio_pin_set_dt(&modem_enable, 1);
-	k_sleep(K_SECONDS(3));
 
 	exit(start_app());
 	return 0;
