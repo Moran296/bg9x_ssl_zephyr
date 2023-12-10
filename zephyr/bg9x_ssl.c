@@ -1,3 +1,9 @@
+/*
+ * Copyright (c) 2023 Moran Rozenszajn
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #define _GNU_SOURCE
 #include <string.h>
 #include <zephyr/logging/log.h>
@@ -326,7 +332,7 @@ static void on_cxreg_match_cb(struct modem_chat *chat, char **argv, uint16_t arg
     if (modem_cellular_is_registered(data))
     {
         notify_modem_success(data, MODEM_EVENT_UNSOL, UNSOL_EVENT_REGISTERED);
-        LOG_INF("Modem registered");
+        LOG_INF("~Modem Registered~");
     }
     else
     {
@@ -343,7 +349,7 @@ static void upload_finish_match_cb(struct modem_chat *chat, char **argv, uint16_
     }
     else
     {
-        LOG_INF("Upload file finished successfully");
+        LOG_DBG("Upload file finished successfully");
     }
 }
 
@@ -369,12 +375,12 @@ static size_t modem_transmit_data(struct bg9x_ssl_modem_data *data, const uint8_
 
         transmitted += ret;
 
-        // only perform delay if we have more to send. This is critical for throughput
+        // only perform delay if we have more to send.
         if (transmitted < len)
             k_sleep(K_MSEC(100));
     }
 
-    LOG_INF("Data of size %d transmitted", len);
+    LOG_DBG("Data of size %d transmitted", len);
     return len;
 }
 
@@ -390,7 +396,7 @@ static void unsol_closed_match_cb(struct modem_chat *chat, char **argv, uint16_t
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
 
-    LOG_INF("QSSLURC: closed -> update_socket_state");
+    LOG_DBG("UNSOL QSSLURC: closed ---> update_socket_state");
     if (k_mutex_lock(&data->modem_mutex, K_SECONDS(1)) != 0)
     {
         LOG_ERR("failed to lock modem mutex, closing socket anyway");
@@ -405,7 +411,7 @@ static void unsol_recv_match_cb(struct modem_chat *chat, char **argv, uint16_t a
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
 
-    LOG_INF("QSSLURC: recv -> signal data ready");
+    LOG_DBG("UNSOL QSSLURC: recv ---> raise signal data ready");
     k_poll_signal_raise(&data->sig_data_ready, 0);
 }
 
@@ -620,7 +626,7 @@ static struct zsock_addrinfo *parse_addr_info(struct bg9x_ssl_modem_data *data, 
         start++;
     }
 
-    LOG_INF("DNS resolved to %s", start);
+    LOG_DBG("DNS resolved to %s", start);
     struct zsock_addrinfo *addr = generate_zsock_addr(data, start);
     if (!addr)
     {
@@ -703,7 +709,7 @@ static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t 
         }
 
         data->expected_addr_count = expected_addresses;
-        LOG_DBG("DNS resolved to %d addresses", expected_addresses);
+        LOG_DBG("DNS resolve expected result count: %d", expected_addresses);
     }
     else
     {
@@ -868,7 +874,7 @@ static void qsslopen_match_cb(struct modem_chat *chat, char **argv, uint16_t arg
 
     data->socket_state = SSL_SOCKET_STATE_CONNECTED;
     data->socket_blocking = true;
-    LOG_INF("socket open success");
+    LOG_INF("socket opened successfully");
 }
 
 MODEM_CHAT_MATCH_DEFINE(qsslopen_match, "+QSSLOPEN: ", ",", qsslopen_match_cb);
@@ -891,6 +897,7 @@ static int bg9x_ssl_open_socket(struct bg9x_ssl_modem_data *data, const char *ip
         return -EISCONN;
     }
 
+    LOG_INF("socket connect to %s:%d requested...", ip, port);
     snprintk(socket_open_cmd_buf, sizeof(socket_open_cmd_buf), "AT+QSSLOPEN=1,1,1,\"%s\",%d,%d", ip, port, QUECTEL_BUFFER_ACCESS_MODE);
     ret = modem_run_script_and_wait(data, &bg9x_open_socket_chat_script);
     if (ret != MODEM_CHAT_SCRIPT_RESULT_SUCCESS)
@@ -942,6 +949,7 @@ static int bg9x_ssl_close_socket(struct bg9x_ssl_modem_data *data)
         return 0;
     }
 
+    LOG_DBG("running socket cleanup and close");
     socket_cleanup(data);
 
     ret = modem_run_script_and_wait(data, &bg9x_close_socket_chat_script);
@@ -1021,6 +1029,8 @@ MODEM_CHAT_SCRIPT_DEFINE(bg9x_fetch_state_chat_script, bg9x_fetch_state_chat_scr
 static enum bg9x_ssl_modem_socket_state bg9x_ssl_update_socket_state(struct bg9x_ssl_modem_data *data)
 {
     enum bg9x_ssl_modem_socket_state last_state = data->socket_state;
+
+    LOG_DBG("aquire socket state requested");
     int ret = modem_run_script_and_wait(data, &bg9x_fetch_state_chat_script);
     if (ret != MODEM_CHAT_SCRIPT_RESULT_SUCCESS)
     {
@@ -1119,6 +1129,8 @@ static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t 
         return -ENOTCONN;
     }
 
+    LOG_INF("socket send with len %d requested", len);
+
     // transmit send request
     snprintk(socket_send_cmd_buf, sizeof(socket_open_cmd_buf), "AT+QSSLSEND=1,%d", len);
     ret = modem_chat_script_run(&data->chat, &bg9x_ssl_send_chat_script);
@@ -1128,7 +1140,7 @@ static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t 
         return ret;
     }
 
-    // sleep to allow modem to open prompt...
+    LOG_DBG("sleeping for 150ms to allow modem to open prompt");
     k_sleep(K_MSEC(150));
 
     // transmit data in chunks until len
@@ -1313,13 +1325,14 @@ void pipe_recv_cb(struct modem_pipe *pipe, enum modem_pipe_event event,
             /* socket closed while reading, this is not an error,
             some data might have been received and then socket closed,
             but it still should be handled as a socket close */
-            LOG_DBG("socket closed while reading");
+            LOG_DBG("recv socket closed while reading detected");
             notify_modem_success(data, MODEM_EVENT_SCRIPT, SCRIPT_RECV_STATE_CONN_CLOSED);
             return;
         }
 
         if (is_recv_finished(data))
         {
+            LOG_DBG("recv finish response detected");
             notify_modem_success(data, MODEM_EVENT_SCRIPT, SCRIPT_RECV_STATE_FINISHED);
             return;
         }
@@ -1345,6 +1358,8 @@ static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, 
         return 0;
     }
 
+    LOG_INF("recv with %d size requested", requested_size);
+
     // ========= pipe detached mode, must reattach before function exit =========
     modem_chat_release(&data->chat);
     modem_pipe_attach(data->uart_pipe, pipe_recv_cb, data);
@@ -1355,7 +1370,7 @@ static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, 
 
     // send request for reading data with the size of the receiving buffer plus header and footer
     snprintk(socket_recv_cmd_buf, sizeof(socket_recv_cmd_buf), "AT+QSSLRECV=1,%d\r", max_len);
-    LOG_INF("Sending %s...", socket_recv_cmd_buf);
+    LOG_DBG("Sending %s...", socket_recv_cmd_buf);
     ret = modem_pipe_transmit(data->uart_pipe, socket_recv_cmd_buf, strlen(socket_recv_cmd_buf));
     if (ret < 0)
     {
@@ -1419,6 +1434,8 @@ exit:
 int bg9x_ssl_modem_interface_start(struct bg9x_ssl_modem_data *data)
 {
     int ret;
+
+    LOG_INF("Modem interface start requested");
 
     // configure files, ssl config
     ret = bg9x_ssl_configure(data);

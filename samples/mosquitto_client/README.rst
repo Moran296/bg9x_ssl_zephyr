@@ -1,15 +1,60 @@
-.. _bg9x_ssl_simplae_socket_sample:
-
-bg9x ssl simple socket sample
-########################
+BG9X SSL Mosquitto Publisher Sample
+###################################
 
 Overview
 ********
-TODO
+This is a sample that demonstrates how to use the BG9X modem
+with mosquitto mqtt client to publish messages to a broker
+using a secure connection.
+
+Prerequisites
+*************
+1. A BG9X modem with SIM, antenna and a valid APN.
+2. CA certificate for the broker
+3. Client certificate and key (optional)
 
 
-Notes
-*****
+Mosquitto broker setup
+**********************
+The sample uses `mosquitto test broker <https://test.mosquitto.org/>`_
+to demonstrate mqtt publish functionality.
+
+For port 8883 (encrypted, unauthenticated), only ca cert is required.
+It is provided in the sample main directory as 'mosquitto.org.crt'.
+In prj.conf, set::
+
+        CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL=1
+        CONFIG_BG9X_SSL_MODEM_CA_CERT="mosquitto.org.crt"
+
+For port 8884 (encrypted, authenticated), client cert and key are also required.
+Follow the steps `here <https://test.mosquitto.org/ssl/>`_
+In prj.conf, set::
+
+        CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL=2
+        CONFIG_BG9X_SSL_MODEM_CA_CERT="mosquitto.org.crt"
+        CONFIG_BG9X_SSL_MODEM_CLIENT_CERT="client.crt"
+        CONFIG_BG9X_SSL_MODEM_CLIENT_KEY="client.key"
+
+To test the sample, run mosquitto client in a terminal window,
+according to the port and seclevel::
+
+        mosquitto_sub -h test.mosquitto.org -p 8883 -t "bg9xssl" -d --cafile mosquitto.org.crt
+        mosquitto_sub -h test.mosquitto.org -p 8884 -t "bg9xssl" -d --cafile mosquitto.org.crt --cert client.crt --key client.key
+
+You should see the output as messages published by the sample as::
+        BG9XSSL:QoS0
+
+        BG9XSSL:QoS1
+
+        BG9XSSL:QoS2
+
+
+        ...
+
+
+
+Device Tree Setup
+*****************
 
 This sample uses the devicetree alias modem to identify
 the modem instance to use. The sample also presumes that
@@ -19,9 +64,7 @@ Setup
 *****
 
 Start by setting up the devicetree with the required
-devicetree node:
-
-.. code-block:: devicetree
+devicetree node::
 
    /dts-v1/;
 
@@ -41,10 +84,9 @@ devicetree node:
            modem: modem {
                    compatible = "quectel,bg9x";
                    mdm-power-gpios = <&gpioe 2 GPIO_ACTIVE_HIGH>;
-                   mdm-reset-gpios = <&gpioe 3 GPIO_ACTIVE_HIGH>;
                    status = "okay";
            };
    };
 
 Next, the UART API must be specified using ``CONFIG_UART_ASYNC_API=y``. The driver doesn't support UART polling.
-Lastly, the APN must be configured using ``BG9X_SSL_MODEM_APN=""``.
+Lastly, the APN must be configured using ``BG9X_MODEM_SSL_APN=""``.

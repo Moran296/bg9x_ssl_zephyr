@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, Bjarki Arge Andreasen
+ * Copyright (c) 2017 Intel Corporation
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -164,7 +164,7 @@ void mqtt_evt_handler(struct mqtt_client *const client,
 
 static char *get_mqtt_payload(enum mqtt_qos qos)
 {
-	static char payload[] = "MORAN:OPEN_QoSx";
+	static char payload[] = "BG9XSSL:QoSx";
 
 	payload[strlen(payload) - 1] = '0' + qos;
 
@@ -173,7 +173,7 @@ static char *get_mqtt_payload(enum mqtt_qos qos)
 
 static char *get_mqtt_topic(void)
 {
-	return "sensors";
+	return "bg9xssl";
 }
 
 static int msgid = 10;
