@@ -44,12 +44,12 @@ Next, configure the required security level:
 - For encryption without client authentication, security level 1 is required and CA certificate is mandatory.
 ```
 CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL=1
-CONFIG_BG9X_SSL_MODEM_CA_CERT="mosquitto.ca.crt"
+CONFIG_BG9X_SSL_MODEM_CA_CERT="mosquitto.org.crt"
 ```
 - For encryption with client authentication, security level 2 is required and CA certificate, client certificate and client key are mandatory.
 ```
 CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL=2
-CONFIG_BG9X_SSL_MODEM_CA_CERT="mosquitto.ca.crt"
+CONFIG_BG9X_SSL_MODEM_CA_CERT="mosquitto.org.crt"
 CONFIG_BG9X_SSL_MODEM_CLIENT_CERT="client.crt"
 CONFIG_BG9X_SSL_MODEM_CLIENT_KEY="client.key"
 ```
