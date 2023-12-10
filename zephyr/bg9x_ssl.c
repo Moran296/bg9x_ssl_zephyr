@@ -450,6 +450,10 @@ static void bg9x_ssl_chat_callback_handler(struct modem_chat *chat,
  * =======================================================================
  * This section contains code for uploading files to the modem.
  * It includes writing CA cert, client certificate and key files.
+ *
+ * Every file upload starts by deleting the old file. If it does not exist
+ * or deleted, we proceed to upload the file. The modem responds with bytes uploaded
+ * and checksum (that is currently not being checked).
  * ========================================================================
  */
 
@@ -557,10 +561,11 @@ static int bg9x_ssl_write_files(struct bg9x_ssl_modem_data *data)
  * This contains code for resolving dns address using AT+QIDNSGIP command.
  *
  * We first send a AT+QIDNSGIP=1,"hostname" request with the host name.
- * We wait for OK, then +QIURC: "dnsgip", <ResultCode>, <address_count>, <ttl>
+ * We wait for OK on the script event. Then we wait for unsolicited event
+ * +QIURC: "dnsgip", <ResultCode>, <address_count>, <ttl>
  * and then for each address for <address_count> we get +QIURC: "dnsgip","<IP_addr>"
- * After we received all addresses and allocated them, we can notify the script
- * event which will unblock the caller.
+ * Once we resolved and allocated <address count> addresses, we notify the function
+ * to continue and return the result.
  *
  * ========================================================================
  */
@@ -837,7 +842,9 @@ static int bg9x_ssl_modem_start(struct bg9x_ssl_modem_data *data)
  * =======================================================================
  *                          MODEM SOCKET OPEN
  * =======================================================================
- * This contains code for socket open procedure
+ * This contains code for socket open procedure. This is pretty straightforward.
+ * We request for AT+QSSLOPEN with the ip and the port. We wait for OK and then
+ * +QSSLOPEN with the result code as the 3rd return paramter
  *
  * ========================================================================
  */
@@ -899,12 +906,15 @@ static int bg9x_ssl_open_socket(struct bg9x_ssl_modem_data *data, const char *ip
  *                          MODEM SOCKET CLOSE
  * =======================================================================
  * This contains code for socket close procedure.
- * Close is a difficult beast because unsolicited close can appear while
- * is sending/reading. So a call to socket_close can be made from any state
- * and it cannot block.
  *
- * a call to close should stop all other operations, set the socket state for closing
- * and clear the socket data.
+ * close can occur on:
+ *  - user request
+ *  - unsolicited event
+ *  - error while receiving/sending
+ *
+ * Currenlty the problem is unsolicited, because it happens most probably
+ * on sys work queue and taking the mutex might be a problem.
+ *
  * ========================================================================
  */
 
@@ -937,7 +947,7 @@ static int bg9x_ssl_close_socket(struct bg9x_ssl_modem_data *data)
     ret = modem_run_script_and_wait(data, &bg9x_close_socket_chat_script);
     if (ret != MODEM_CHAT_SCRIPT_RESULT_SUCCESS)
     {
-        LOG_ERR("Failed to close socket: %d", ret);
+        LOG_ERR("Failed closing socket: %d", ret);
         data->socket_state = SSL_SOCKET_STATE_UNKNOWN;
         return -EIO;
     }
@@ -948,9 +958,11 @@ static int bg9x_ssl_close_socket(struct bg9x_ssl_modem_data *data)
 
 /*
  * =======================================================================
- *                          MODEM FETCH ERROR
+ *                          MODEM ERROR HANDLING
  * =======================================================================
- * This contains code for fetching error descriptions from modem
+ * This contains code for:
+ * - fetching error descriptions from modem
+ * - fetching the socket state
  *
  * ========================================================================
  */
@@ -1033,23 +1045,29 @@ static enum bg9x_ssl_modem_socket_state bg9x_ssl_update_socket_state(struct bg9x
  *
  * This implements sending in buffer access mode. First we request to send
  * data of size X. The modem opens up a prompt ">".
- * Then we send the data in chunks of size Y on the modem uart pipe until
+ * Since the prompt does not appear on the chat, we currently just delay for
+ * some millisecond and try to transmit anyway
+ *
+ * We send the data in chunks of size Y on the modem uart pipe until
  * we have X. On that point the modem should acknowledge the data with
  * "SEND OK" and we are done.
+ *
+ * If the modem buffer is full, it would respond with "SEND FAIL", on that
+ * case we should return -EAGAIN for the user to try again
  * ========================================================================
  */
 
 static void send_success_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
-    LOG_DBG("Send OK");
+    LOG_DBG("SEND OK");
     notify_modem_success(data, MODEM_EVENT_SCRIPT, SCRIPT_STATE_SUCCESS);
 }
 
 static void send_fail_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
-    LOG_WRN("Send: Connection is established but sending buffer is full");
+    LOG_WRN("SEND FAIL: Connection is established but sending buffer is full");
     notify_modem_success(data, MODEM_EVENT_SCRIPT, -EAGAIN);
 }
 
@@ -1381,7 +1399,7 @@ static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, 
 exit:
     modem_pipe_release(data->uart_pipe);
     modem_chat_attach(&data->chat, data->uart_pipe);
-    // ========= pipe detached mode, must reattach before function exit =========
+    // ================= pipe detached mode reattach =================
 
     if (connection_reset_occured)
     {
@@ -1539,22 +1557,6 @@ static ssize_t offload_sendmsg(void *obj, const struct msghdr *msg, int flags)
             {
                 errno = -rc;
                 return rc;
-                // if (data->socket_blocking == false)
-                // {
-                //     errno = -rc;
-                //     return rc;
-                // }
-
-                // if (rc == -EAGAIN)
-                // {
-                //     k_sleep(K_MSEC(200));
-                // }
-
-                // else
-                // {
-                //     sent = rc;
-                //     break;
-                // }
             }
             else
             {
@@ -1615,13 +1617,6 @@ void bg9x_ssl_freeaddrinfo(struct zsock_addrinfo *res)
         free(res);
         res = next;
     }
-
-    k_mutex_lock(&modem_data.modem_mutex, K_FOREVER);
-
-    modem_data.last_resolved_addr_info = NULL;
-    modem_data.expected_addr_count = 0;
-
-    k_mutex_unlock(&modem_data.modem_mutex);
 }
 
 int ioctl_poll_prepare(struct bg9x_ssl_modem_data *data, struct zsock_pollfd *pfd, struct k_poll_event **pev,
@@ -1763,8 +1758,7 @@ static void modem_net_iface_init(struct net_if *iface)
  * =======================================================================
  *                          Device power management
  * =======================================================================
- * This should be respnsible for turning device on/off upon request
- * Should this also be responsible for setting the device as network interface?
+ * This is respnsible for turning device on/off upon request
  * ========================================================================
  */
 
