@@ -36,6 +36,14 @@ LOG_MODULE_REGISTER(modem_quectel_bg9x_ssl, CONFIG_MODEM_LOG_LEVEL);
 #define CLIENT_KEY_FILE_NAME "cl_k_file"
 #define SECLEVEL STRINGIFY(CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL)
 
+// RECV RELATED DEFINES
+#define RECV_BUFFER_METADATA_SIZE 128
+#define QSSL_RECV "+QSSLRECV: "
+#define UNSOL_CLOSED "+QSSLURC: \"closed\""
+#define UNSOL_RECV "URC: \"recv\""
+#define OK_ON_SEND "\r\n\r\nOK\r\n"
+#define MIN_VALID_RECV_SIZE (strlen(QSSL_RECV "#") + strlen(OK_ON_SEND))
+
 #if CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL > 0
 uint8_t ca_cert_default[] = {
 #include "bg95_ssl_ca_cert.inc"
@@ -67,7 +75,6 @@ enum bg9x_ssl_modem_script_events
     SCRIPT_STATE_SUCCESS = 0,
     // RECV related
     SCRIPT_RECV_STATE_FINISHED = 3,
-    SCRIPT_RECV_STATE_CONN_CLOSED = 4,
 
 };
 
@@ -1172,9 +1179,13 @@ static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t 
  * First an unsolicited command is received from the modem that data is ready.
  * Than we detach the chat and manually send AT+QSSLRECV=1,<size> to the modem.
  * We leave enough place in the buffer for "AT+QSSLRECV: <size>\r\n" that appears
- * before the data and "\r\n\r\nOK\r\n" that appears after the data.
- * This should also check if after the data there is a socket closed message
- * (+QSSLURC: "closed") and set the socket_connected flag to false if so
+ * before the data and "\r\n\r\nOK\r\n" (and also other unsolicited messages)
+ *
+ * Upon receiving the data ("\r\nOK\r\n" received), or timeout, we reattach
+ * the chat so no unsolicited messages are lost.
+ *
+ * The data is then parsed and the buffer is moved to the beginning of the buffer.
+ * The size is verified with the size received from the modem. The size is returned to the user
  * ========================================================================
  */
 
@@ -1184,10 +1195,10 @@ bool is_recv_socket_close(struct bg9x_ssl_modem_data *data)
     size_t size = data->pipe_recv_total;
     const char *buf = data->data_to_receive;
 
-    if (size < ((sizeof("+QSSLURC: \"closed\"") - 1) + sizeof("\r\n+QSSLRECV: #\r\n")))
+    if (size < MIN_VALID_RECV_SIZE)
         return false;
 
-    return memmem(buf, size, "\r\n+QSSLURC: \"closed\"", strlen("\r\n+QSSLURC: \"closed\"")) != NULL;
+    return memmem(buf, size, "\r\n" UNSOL_CLOSED, strlen("\r\n" UNSOL_CLOSED)) != NULL;
 }
 
 // check if buffer ends with "\r\n\r\nOK or \r\n+QSSLRECV: #\r\n"
@@ -1196,25 +1207,35 @@ bool is_recv_finished(struct bg9x_ssl_modem_data *data)
     size_t size = data->pipe_recv_total;
     const char *buf = data->data_to_receive;
 
-    if (size < ((strlen("\r\n\r\nOK\r\n")) + strlen("\r\n+QSSLRECV: #")))
+    if (size < MIN_VALID_RECV_SIZE)
         return false;
 
-    const char *read_end = memmem(buf, size, "\r\n\r\nOK\r\n", strlen("\r\n\r\nOK\r\n"));
+    const char *read_end = memmem(buf, size, OK_ON_SEND, strlen(OK_ON_SEND));
 
     return read_end != NULL;
 }
 
 int parse_recv_size(const char *buf, size_t size)
 {
-    if (size < 20)
+    if (size < MIN_VALID_RECV_SIZE)
         return -EINVAL;
 
-    const char *start = strnstr(buf, "+QSSLRECV: ", 20);
+    const char *start = strnstr(buf, QSSL_RECV, size);
     if (start == NULL)
+    {
+        LOG_ERR("Could not find" QSSL_RECV "in buffer");
         return -EINVAL;
+    }
 
-    start += strlen("+QSSLRECV: ");
-    return try_atoi(start);
+    start += strlen(QSSL_RECV);
+    int len = try_atoi(start);
+    if (len < 0)
+    {
+        LOG_ERR("Could not parse recv size in buffer. %s", start);
+        return -EINVAL;
+    }
+
+    return len;
 }
 
 const char *get_recv_data_start_pos(const char *buf, size_t size)
@@ -1222,15 +1243,23 @@ const char *get_recv_data_start_pos(const char *buf, size_t size)
     if (size < 20)
         return NULL;
 
-    const char *first_occurrence = strnstr(buf, "\r\n", 20);
-    if (first_occurrence == NULL)
+    const char *start_msg = strnstr(buf, QSSL_RECV, size);
+    if (start_msg == NULL)
         return NULL;
 
-    const char *second_occurrence = strnstr(first_occurrence + 2, "\r\n", 20);
-    if (second_occurrence == NULL)
+    const char *newline = strnstr(start_msg, "\r\n", 20);
+    if (newline == NULL)
         return NULL;
 
-    return second_occurrence + 2;
+    return newline + 2;
+}
+
+bool is_recv_new_data_ready(struct bg9x_ssl_modem_data *data)
+{
+    return memmem(data->data_to_receive,
+                  data->pipe_recv_total,
+                  UNSOL_RECV,
+                  strlen(UNSOL_RECV)) != NULL;
 }
 
 int parse_and_extract_recv_data(struct bg9x_ssl_modem_data *data)
@@ -1258,7 +1287,7 @@ int parse_and_extract_recv_data(struct bg9x_ssl_modem_data *data)
         return response_recv_size;
     }
 
-    // In case response size == 0, one "/r/n" is ommitted and should be ignored
+    // SPECIAL CASE: In case response size == 0, one "/r/n" is ommitted and should be ignored
     if (response_recv_size == 0)
     {
         start_pos -= 2;
@@ -1266,7 +1295,7 @@ int parse_and_extract_recv_data(struct bg9x_ssl_modem_data *data)
 
     LOG_DBG("response recv size %d", response_recv_size);
 
-    end_pos = memmem(start_pos, data->pipe_recv_total - (start_pos - data->data_to_receive), "\r\n\r\nOK\r\n", strlen("\r\n\r\nOK\r\n"));
+    end_pos = memmem(start_pos, data->pipe_recv_total - (start_pos - data->data_to_receive), OK_ON_SEND, strlen(OK_ON_SEND));
     if (end_pos == NULL)
     {
         LOG_ERR("Failed to parse recv response end position");
@@ -1320,19 +1349,13 @@ void pipe_recv_cb(struct modem_pipe *pipe, enum modem_pipe_event event,
         LOG_DBG("pipe received %d bytes", ret);
         data->pipe_recv_total += ret;
 
-        if (is_recv_socket_close(data))
-        {
-            /* socket closed while reading, this is not an error,
-            some data might have been received and then socket closed,
-            but it still should be handled as a socket close */
-            LOG_DBG("recv socket closed while reading detected");
-            notify_modem_success(data, MODEM_EVENT_SCRIPT, SCRIPT_RECV_STATE_CONN_CLOSED);
-            return;
-        }
-
         if (is_recv_finished(data))
         {
             LOG_DBG("recv finish response detected");
+
+            modem_pipe_release(data->uart_pipe);
+            modem_chat_attach(&data->chat, data->uart_pipe);
+
             notify_modem_success(data, MODEM_EVENT_SCRIPT, SCRIPT_RECV_STATE_FINISHED);
             return;
         }
@@ -1349,7 +1372,8 @@ static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, 
     int ret;
     char socket_recv_cmd_buf[sizeof("AT+QSSLRECV=##,####")];
     bool connection_reset_occured = false;
-    size_t recv_buf_ability = sizeof(data->uart_backend_receive_buf) - strlen("\r\n+QSSLRECV: ####\r\n") - sizeof("\r\n\r\nOK\r\n");
+    bool recv_data_ready_occured = false;
+    size_t recv_buf_ability = sizeof(data->uart_backend_receive_buf) - RECV_BUFFER_METADATA_SIZE;
     size_t max_len = requested_size > recv_buf_ability ? recv_buf_ability : requested_size;
 
     if (data->socket_state != SSL_SOCKET_STATE_CONNECTED)
@@ -1375,24 +1399,37 @@ static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, 
     if (ret < 0)
     {
         LOG_ERR("Failed to transmit QSSLRECV: %d", ret);
-        goto exit;
+        modem_pipe_release(data->uart_pipe);
+        modem_chat_attach(&data->chat, data->uart_pipe);
+        return ret;
     }
 
     // wait for modem to send data until footer \r\n\r\nOK\r\n
-    ret = wait_on_modem_event(data, MODEM_EVENT_SCRIPT, K_MSEC(250));
+    // If success, pipe was reattached to modem chat on pipe_recv_callback
+    ret = wait_on_modem_event(data, MODEM_EVENT_SCRIPT, K_MSEC(1000));
     if (ret != SCRIPT_RECV_STATE_FINISHED)
     {
         // handle eof before finishing if needed
-        if (ret == SCRIPT_RECV_STATE_CONN_CLOSED)
-        {
-            connection_reset_occured = true;
-        }
-        else
-        {
-            LOG_ERR("recv: expected finished or eof events but got %d", ret);
-            ret = ret < 0 ? ret : -EINVAL;
-            goto exit;
-        }
+        LOG_ERR("recv: expected finished but got %d", ret);
+        modem_pipe_release(data->uart_pipe);
+        modem_chat_attach(&data->chat, data->uart_pipe);
+
+        return ret < 0 ? ret : -EINVAL;
+    }
+
+    if (is_recv_new_data_ready(data))
+    {
+        LOG_DBG("new data ready");
+        recv_data_ready_occured = true;
+    }
+
+    if (is_recv_socket_close(data))
+    {
+        /* socket closed while reading, this is not an error,
+        some data might have been received and then socket closed,
+        but it still should be handled as a socket close */
+        LOG_DBG("recv socket closed while reading detected");
+        connection_reset_occured = true;
     }
 
     // extract data, validate and then discard header & footer
@@ -1400,25 +1437,24 @@ static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, 
     if (ret < 0)
     {
         LOG_ERR("Failed to parse and extract recv data: %d", ret);
-        goto exit;
+        return ret;
     }
 
     // if parsed correctly but no data available, handle accordingly
-    if (ret == 0)
+    if (ret == 0 && !recv_data_ready_occured)
     {
         k_poll_signal_reset(&data->sig_data_ready);
         if (data->socket_blocking == false)
             ret = -EAGAIN;
     }
 
-exit:
-    modem_pipe_release(data->uart_pipe);
-    modem_chat_attach(&data->chat, data->uart_pipe);
-    // ================= pipe detached mode reattach =================
-
     if (connection_reset_occured)
     {
         bg9x_ssl_close_socket(data);
+    }
+    else if (recv_data_ready_occured)
+    {
+        k_poll_signal_raise(&data->sig_data_ready, 0);
     }
 
     return ret;
@@ -1604,7 +1640,7 @@ int bg9x_ssl_getaddrinfo(const char *node, const char *service,
         return -EINVAL;
     }
 
-    if (hints && hints->ai_family != AF_INET)
+    if (hints && (hints->ai_family != AF_INET && hints->ai_family != AF_UNSPEC))
     {
         LOG_ERR("Not suppoerted family");
         errno = EAFNOSUPPORT;
