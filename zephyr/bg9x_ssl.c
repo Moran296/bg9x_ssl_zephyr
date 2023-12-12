@@ -15,7 +15,11 @@
 #include <zephyr/modem/chat.h>
 #include <zephyr/modem/pipe.h>
 #include <zephyr/modem/backend/uart.h>
+#include <zephyr/net/tls_credentials.h>
 #include <sockets_internal.h>
+#if defined(CONFIG_NET_SOCKETS_SOCKOPT_TLS)
+#include "tls_internal.h"
+#endif
 
 #include <zephyr/pm/device.h>
 
@@ -45,16 +49,16 @@ LOG_MODULE_REGISTER(modem_quectel_bg9x_ssl, CONFIG_MODEM_LOG_LEVEL);
 #define MIN_VALID_RECV_SIZE (strlen(QSSL_RECV "#") + strlen(OK_ON_SEND))
 
 #if CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL > 0
-uint8_t ca_cert_default[] = {
+static uint8_t ca_cert_default[] = {
 #include "bg95_ssl_ca_cert.inc"
 };
 #endif
 
 #if CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL > 1
-uint8_t client_cert_default[] = {
+static uint8_t client_cert_default[] = {
 #include "bg95_ssl_client_cert.inc"
 };
-uint8_t client_key_default[] = {
+static uint8_t client_key_default[] = {
 #include "bg95_ssl_client_key.inc"
 };
 
@@ -155,8 +159,12 @@ struct bg9x_ssl_modem_data
 
     // certs
     const uint8_t *ca_cert;
+    size_t ca_cert_len;
     const uint8_t *client_cert;
+    size_t client_cert_len;
     const uint8_t *client_key;
+    size_t client_key_len;
+    uint8_t files_uploaded;
 
     // error handling
     int last_error;
@@ -189,6 +197,7 @@ extern char *strnstr(const char *haystack, const char *needle, size_t haystack_s
 static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data);
 static int offload_socket(int family, int type, int proto);
 static int bg9x_ssl_close_socket(struct bg9x_ssl_modem_data *data);
+static int bg9x_ssl_fetch_error(struct bg9x_ssl_modem_data *data);
 
 static struct bg9x_ssl_modem_data modem_data = {
     .chat_delimiter = {'\r'},
@@ -339,7 +348,7 @@ static void on_cxreg_match_cb(struct modem_chat *chat, char **argv, uint16_t arg
     if (modem_cellular_is_registered(data))
     {
         notify_modem_success(data, MODEM_EVENT_UNSOL, UNSOL_EVENT_REGISTERED);
-        LOG_INF("~Modem Registered~");
+        LOG_INF("~*~*~Modem Registered~*~*~");
     }
     else
     {
@@ -475,20 +484,22 @@ MODEM_CHAT_MATCH_DEFINE(file_not_exist, QUECTEL_CME_ERR_FILE_DOES_NOT_EXIST, "",
 MODEM_CHAT_MATCHES_DEFINE(delete_file_matches, ok_match, file_not_exist);
 
 // overwritten in write_modem_file
-char del_file_cmd_buf[sizeof("AT+QFDEL=\"some_file_name_max\"")];
-char upload_file_cmd_buf[sizeof("AT+QFUPL=\"some_file_name_max\",####")];
+static char del_file_cmd_buf[sizeof("AT+QFDEL=\"some_file_name_max\"")];
+static char upload_file_cmd_buf[sizeof("AT+QFUPL=\"some_file_name_max\",####")];
 
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_upload_file_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP_MULT(del_file_cmd_buf, delete_file_matches),
                               MODEM_CHAT_SCRIPT_CMD_RESP(upload_file_cmd_buf, upload_file_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("", upload_finish_match), );
+                              MODEM_CHAT_SCRIPT_CMD_RESP("", upload_finish_match));
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_upload_file_chat_script, bg9x_ssl_upload_file_chat_script_cmds,
                          abort_matches, bg9x_ssl_chat_callback_handler, 10);
 
 static int write_modem_file(struct bg9x_ssl_modem_data *data, const char *name, const uint8_t *file, size_t size)
 {
+    int ret;
+
     if (size == 0)
     {
         LOG_WRN("%s, file size is 0, skipping file write", name);
@@ -507,7 +518,18 @@ static int write_modem_file(struct bg9x_ssl_modem_data *data, const char *name, 
     data->data_to_upload = file;
     data->data_to_upload_size = size;
 
-    return modem_run_script_and_wait(data, &bg9x_ssl_upload_file_chat_script);
+    ret = modem_run_script_and_wait(data, &bg9x_ssl_upload_file_chat_script);
+    if (ret != 0)
+    {
+        LOG_ERR("Failed to upload file: %d", ret);
+        return ret;
+    }
+
+    // count files uploaded, maximum files == 3
+    data->files_uploaded = data->files_uploaded < 3
+                               ? data->files_uploaded + 1
+                               : 3;
+    return 0;
 }
 
 static int bg9x_ssl_write_files(struct bg9x_ssl_modem_data *data)
@@ -515,54 +537,52 @@ static int bg9x_ssl_write_files(struct bg9x_ssl_modem_data *data)
 
 #if CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL > 0
     int ret;
-    size_t size;
 
-    if (data->ca_cert != NULL)
+    if (data->ca_cert != NULL && data->ca_cert_len > 0)
     {
-        size = data->ca_cert == ca_cert_default ? sizeof(ca_cert_default) : strlen(data->ca_cert);
-        ret = write_modem_file(data, CA_FILE_NAME, data->ca_cert, size);
+        ret = write_modem_file(data, CA_FILE_NAME, data->ca_cert, data->ca_cert_len);
         if (ret != 0)
         {
             LOG_ERR("Failed to write CA file: %d", ret);
             return ret;
         }
 
-        // nullify so will not reupload next connection
+        // nullify so will not reupload next on connection
         data->ca_cert = NULL;
+        data->ca_cert_len = 0;
     }
 #endif
 
 #if CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL > 1
-    if (data->client_cert != NULL)
+    if (data->client_cert != NULL && data->client_cert_len)
     {
-        size = data->client_cert == client_cert_default ? sizeof(client_cert_default) : strlen(data->client_cert);
-        ret = write_modem_file(data, CLIENT_CERT_FILE_NAME, data->client_cert, size);
+        ret = write_modem_file(data, CLIENT_CERT_FILE_NAME, data->client_cert, data->client_cert_len);
         if (ret != 0)
         {
             LOG_ERR("Failed to write client cert file: %d", ret);
             return ret;
         }
 
-        // nullify so will not reupload next connection
+        // nullify so will not reupload on next connection
         data->client_cert = NULL;
+        data->client_cert_len = 0;
     }
 
-    if (data->client_key != NULL)
+    if (data->client_key != NULL && data->client_key_len > 0)
     {
-        size = data->client_key == client_key_default ? sizeof(client_key_default) : strlen(data->client_key);
-        ret = write_modem_file(data, CLIENT_KEY_FILE_NAME, data->client_key, size);
+        ret = write_modem_file(data, CLIENT_KEY_FILE_NAME, data->client_key, data->client_key_len);
         if (ret != 0)
         {
             LOG_ERR("Failed to write client key file: %d", ret);
             return ret;
         }
 
-        // nullify so will not reupload next connection
+        // nullify so will not reupload on next connection
         data->client_key = NULL;
+        data->client_key_len = 0;
     }
 
 #endif
-    LOG_DBG("Files written successfully");
 
     return 0;
 }
@@ -725,7 +745,7 @@ static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t 
 }
 
 // overwritten in modem_dns_resolve functions
-char dns_resolve_cmd_buf[sizeof("AT+QIDNSGIP=1,\"some_host_name_url_max#############\"")];
+static char dns_resolve_cmd_buf[sizeof("AT+QIDNSGIP=1,\"some_host_name_url_max#############\"")];
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_resolve_dns_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP(dns_resolve_cmd_buf, ok_match));
 
@@ -778,20 +798,30 @@ static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *ho
  * It includes setting up the APN, PDP context, and registering to the network.
  * It also configures the modem to use SSL and the SSL configuration.
  *
- * Currently it only supports using files if the compile time security level
- * allows it (ca cert if seclevel >= 1. client cert and key if seclevel == 2).
- * as long as files are configured here, this should run after the file upload step
  *
  * ========================================================================
  */
 
-/* Configure SSL paramters (should run after upload files script) */
+/* Configure hostname validation paramters (called from setsockopt)*/
+MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_hostname_validation_chat_script_cmds,
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"checkhost\",1,1", ok_match), );
+
+MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_hostname_validation_chat_script, bg9x_ssl_hostname_validation_chat_script_cmds,
+                         abort_matches, bg9x_ssl_chat_callback_handler, 2);
+
+int bg9x_ssl_configure_hostname_validation_on(struct bg9x_ssl_modem_data *data)
+{
+    return modem_run_script_and_wait(data, &bg9x_ssl_hostname_validation_chat_script);
+}
+
+/* Configure SSL paramters */
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_configure_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"sslversion\",1,4", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"ciphersuite\",1,0xFFFF", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"negotiatetime\",1,300", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"ignorelocaltime\",1,1", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"checkhost\",1,0", ok_match), // disable hostname validation, can be enabled with setsockopt
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"seclevel\",1," SECLEVEL, ok_match),
 #if CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL > 0
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"cacert\",1,\"" CA_FILE_NAME "\"", ok_match),
@@ -804,6 +834,19 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_configure_chat_script_cmds,
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_configure_chat_script, bg9x_ssl_configure_chat_script_cmds,
                          abort_matches, bg9x_ssl_chat_callback_handler, 10);
+
+static int bg9x_ssl_configure(struct bg9x_ssl_modem_data *data)
+{
+    int ret;
+
+    // write default certs and key if supplied to modem in compile flags
+    ret = bg9x_ssl_write_files(data);
+    if (ret != 0)
+        return ret;
+
+    // configure ssl parameters
+    return modem_run_script_and_wait(data, &bg9x_ssl_configure_chat_script);
+}
 
 /* Register to the network and activate ssl context */
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_register_chat_script_cmds,
@@ -820,19 +863,6 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_register_chat_script_cmds,
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_register_chat_script, bg9x_ssl_register_chat_script_cmds,
                          abort_matches, bg9x_ssl_chat_callback_handler, 150);
-
-static int bg9x_ssl_configure(struct bg9x_ssl_modem_data *data)
-{
-    int ret;
-
-    // write certs and key if supplied to modem
-    ret = bg9x_ssl_write_files(data);
-    if (ret != 0)
-        return ret;
-
-    // configure ssl parameters
-    return modem_run_script_and_wait(data, &bg9x_ssl_configure_chat_script);
-}
 
 static int bg9x_ssl_modem_start(struct bg9x_ssl_modem_data *data)
 {
@@ -904,12 +934,22 @@ static int bg9x_ssl_open_socket(struct bg9x_ssl_modem_data *data, const char *ip
         return -EISCONN;
     }
 
+    if (CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL == 1 && data->files_uploaded < 1)
+    {
+        LOG_WRN("Security level 1 requires CA certificate to be uploaded, socket open might fail");
+    }
+    else if (CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL == 2 && data->files_uploaded < 3)
+    {
+        LOG_WRN("Security level 2 requires CA certificate, client certificate and client key to be uploaded, socket open might fail");
+    }
+
     LOG_INF("socket connect to %s:%d requested...", ip, port);
     snprintk(socket_open_cmd_buf, sizeof(socket_open_cmd_buf), "AT+QSSLOPEN=1,1,1,\"%s\",%d,%d", ip, port, QUECTEL_BUFFER_ACCESS_MODE);
     ret = modem_run_script_and_wait(data, &bg9x_open_socket_chat_script);
     if (ret != MODEM_CHAT_SCRIPT_RESULT_SUCCESS)
     {
         LOG_ERR("Failed to open socket: %d", ret);
+        bg9x_ssl_fetch_error(data);
         return ret < 0 ? ret : -EINVAL;
     }
 
@@ -1367,7 +1407,7 @@ void pipe_recv_cb(struct modem_pipe *pipe, enum modem_pipe_event event,
     }
 }
 
-static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, size_t requested_size, k_timeout_t timeout)
+static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, size_t requested_size)
 {
     int ret;
     char socket_recv_cmd_buf[sizeof("AT+QSSLRECV=##,####")];
@@ -1545,8 +1585,7 @@ static ssize_t offload_recvfrom(void *obj, void *buf, size_t len,
 
     k_mutex_lock(&data->modem_mutex, K_FOREVER);
 
-    k_timeout_t timeout = data->socket_blocking ? K_FOREVER : K_NO_WAIT;
-    ret = bg9x_ssl_socket_recv(data, (uint8_t *)buf, len, timeout);
+    ret = bg9x_ssl_socket_recv(data, (uint8_t *)buf, len);
     if (ret < 0)
         errno = -ret;
 
@@ -1768,6 +1807,110 @@ static int offload_ioctl(void *obj, unsigned int request, va_list args)
     }
 }
 
+#if defined(CONFIG_NET_SOCKETS_SOCKOPT_TLS)
+static int map_credentials(struct bg9x_ssl_modem_data *data, const void *optval, socklen_t optlen)
+{
+    sec_tag_t *sec_tags = (sec_tag_t *)optval;
+    int tags_len;
+    sec_tag_t tag;
+    int i;
+    struct tls_credential *cert;
+
+    if ((optlen % sizeof(sec_tag_t)) != 0 || (optlen == 0))
+    {
+        // LOG_ERR("Invalid sec_tag list length");
+        return -EINVAL;
+    }
+
+    tags_len = optlen / sizeof(sec_tag_t);
+    /* For each tag, retrieve the credentials value and type: */
+    for (i = 0; i < tags_len; i++)
+    {
+        tag = sec_tags[i];
+        cert = credential_next_get(tag, NULL);
+        while (cert != NULL)
+        {
+            switch (cert->type)
+            {
+            case TLS_CREDENTIAL_CA_CERTIFICATE:
+                LOG_DBG("setsockopt: ca certificate found in tag %d", tag);
+                data->ca_cert = cert->buf;
+                data->ca_cert_len = cert->len;
+
+                break;
+            case TLS_CREDENTIAL_SERVER_CERTIFICATE:
+                LOG_DBG("setsockopt: server certificate found in tag %d", tag);
+                data->client_cert = cert->buf;
+                data->client_cert_len = cert->len;
+
+                break;
+            case TLS_CREDENTIAL_PRIVATE_KEY:
+                LOG_DBG("setsockopt: private key found in tag %d", tag);
+                data->client_key = cert->buf;
+                data->client_key_len = cert->len;
+
+                break;
+            default:
+                LOG_WRN("setsockopt: unknown credential type %d", cert->type);
+                /* Not handled */
+                return -EINVAL;
+            }
+
+            cert = credential_next_get(tag, cert);
+        }
+    }
+
+    if (data->ca_cert || data->client_cert || data->client_key)
+    {
+        LOG_DBG("setsockopt: credentials found - writing to modem");
+        return bg9x_ssl_write_files(data);
+    }
+
+    LOG_WRN("setsockopt: no credentials found");
+    return 0;
+}
+#else
+static int map_credentials(struct bg9x_ssl_modem_data *data, const void *optval, socklen_t optlen)
+{
+    LOG_ERR("CONFIG_NET_SOCKETS_SOCKOPT_TLS is not enabled");
+    return -EINVAL;
+}
+#endif
+
+static int offload_setsockopt(void *obj, int level, int optname, const void *optval, socklen_t optlen)
+{
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)obj;
+    int ret;
+
+    LOG_DBG("setsockopt optname %d, level %d", optname, level);
+    if (IS_ENABLED(CONFIG_NET_SOCKETS_SOCKOPT_TLS))
+    {
+        switch (optname)
+        {
+        case TLS_SEC_TAG_LIST:
+            ret = map_credentials(data, optval, optlen);
+
+            break;
+
+        case TLS_HOSTNAME:
+        case TLS_PEER_VERIFY:
+            ret = 0;
+
+            break;
+        default:
+            LOG_WRN("setsockopt option %d not supported", optname);
+            ret = -ENOTSUP;
+        }
+    }
+    else
+    {
+        LOG_ERR("CONFIG_NET_SOCKETS_SOCKOPT_TLS is not enabled");
+        ret = -EINVAL;
+    }
+
+    return ret;
+}
+
 static const struct socket_op_vtable offload_socket_fd_op_vtable = {
     .fd_vtable = {
         .read = offload_read,
@@ -1783,7 +1926,7 @@ static const struct socket_op_vtable offload_socket_fd_op_vtable = {
     .accept = NULL,
     .sendmsg = offload_sendmsg,
     .getsockopt = NULL,
-    .setsockopt = NULL,
+    .setsockopt = offload_setsockopt,
 };
 
 const struct socket_dns_offload dns_vtable = {
@@ -1913,12 +2056,17 @@ static int bg9x_ssl_init(const struct device *dev)
 
     gpio_pin_configure_dt(&config->power_gpio, GPIO_OUTPUT_INACTIVE);
 
+    data->files_uploaded = 0;
 #if CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL > 0
     data->ca_cert = sizeof(ca_cert_default) > 0 ? ca_cert_default : NULL;
+    data->ca_cert_len = data->ca_cert ? sizeof(ca_cert_default) : 0;
 #endif
 #if CONFIG_BG9X_SSL_MODEM_SECURITY_LEVEL > 1
     data->client_cert = sizeof(client_cert_default) > 0 ? client_cert_default : NULL;
+    data->client_cert_len = data->client_cert ? sizeof(client_cert_default) : 0;
+
     data->client_key = sizeof(client_key_default) > 0 ? client_key_default : NULL;
+    data->client_key_len = data->client_key ? sizeof(client_key_default) : 0;
 #endif
 
     data->socket_blocking = true;

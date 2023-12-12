@@ -13,7 +13,7 @@ set(gen_dir ${ZEPHYR_BINARY_DIR}/include/generated/)
 
 function(generate_cert_file CONFIG_NAME FILE_NAME)
     if(NOT DEFINED ${CONFIG_NAME} OR ${CONFIG_NAME} STREQUAL "")
-        message(WARNING "No ${FILE_NAME} file specified. SSL will not work")
+        message(WARNING "No ${FILE_NAME} file specified. Must be provided in runtime (using tls_credentials & setsockopt)")
         file(WRITE ${gen_dir}/${FILE_NAME}.inc "")
     elseif(NOT EXISTS ${CMAKE_SOURCE_DIR}/${${CONFIG_NAME}})
         message(FATAL_ERROR "${FILE_NAME} file '${${CONFIG_NAME}}' was not found. Please make sure the file exists in the CMAKE_SOURCE_DIR directory (${CMAKE_SOURCE_DIR})")
