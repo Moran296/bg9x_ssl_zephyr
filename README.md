@@ -1,4 +1,4 @@
-# Out of tree BG9x modem driver with SSL socket offloading for Zephyr RTOS
+# 📡 Out of tree BG9x modem driver with SSL socket offloading for Zephyr RTOS
 
 *Note: This repository is a work in progress*
 
