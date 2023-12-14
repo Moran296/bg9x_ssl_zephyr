@@ -34,7 +34,9 @@ LOG_MODULE_REGISTER(modem_quectel_bg9x_ssl, CONFIG_MODEM_LOG_LEVEL);
 #define QUECTEL_BUFFER_ACCESS_MODE 0
 #define QUECTEL_CME_ERR_FILE_DOES_NOT_EXIST "+CME ERROR: 405"
 
-#define MODEM_MAX_DATA_LENGTH 1024
+#define MODEM_MAX_DATA_LEN 1024
+#define DYNAMIC_CMD_BUFFER_LEN 64
+#define DYNAMIC_CMD_MAX 3
 #define CA_FILE_NAME "ca_file"
 #define CLIENT_CERT_FILE_NAME "cl_c_file"
 #define CLIENT_KEY_FILE_NAME "cl_k_file"
@@ -142,8 +144,8 @@ struct bg9x_ssl_modem_data
     // uart backend
     struct modem_pipe *uart_pipe;
     struct modem_backend_uart uart_backend;
-    uint8_t uart_backend_receive_buf[MODEM_MAX_DATA_LENGTH];
-    uint8_t uart_backend_transmit_buf[MODEM_MAX_DATA_LENGTH];
+    uint8_t uart_backend_receive_buf[MODEM_MAX_DATA_LEN];
+    uint8_t uart_backend_transmit_buf[MODEM_MAX_DATA_LEN];
 
     // chat data
     struct modem_chat chat;
@@ -198,6 +200,9 @@ static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t 
 static int offload_socket(int family, int type, int proto);
 static int bg9x_ssl_close_socket(struct bg9x_ssl_modem_data *data);
 static int bg9x_ssl_fetch_error(struct bg9x_ssl_modem_data *data);
+
+typedef char modem_dynamic_cmd_buffer[DYNAMIC_CMD_BUFFER_LEN];
+static modem_dynamic_cmd_buffer dynamic_cmd_buffers[DYNAMIC_CMD_MAX];
 
 static struct bg9x_ssl_modem_data modem_data = {
     .chat_delimiter = {'\r'},
@@ -432,7 +437,6 @@ static void unsol_recv_match_cb(struct modem_chat *chat, char **argv, uint16_t a
 }
 
 MODEM_CHAT_MATCH_DEFINE(ok_match, "OK", "", NULL);
-MODEM_CHAT_MATCH_DEFINE(upload_file_match, "CONNECT", "", transmit_file_ready_match_cb);
 MODEM_CHAT_MATCH_DEFINE(cpin_match, "+CPIN: READY", "", NULL);
 
 MODEM_CHAT_MATCHES_DEFINE(abort_matches,
@@ -481,16 +485,24 @@ static void bg9x_ssl_chat_callback_handler(struct modem_chat *chat,
 
 MODEM_CHAT_MATCH_DEFINE(upload_finish_match, "+QFUPL: ", ",", upload_finish_match_cb);
 MODEM_CHAT_MATCH_DEFINE(file_not_exist, QUECTEL_CME_ERR_FILE_DOES_NOT_EXIST, "", NULL);
+MODEM_CHAT_MATCH_DEFINE(upload_file_match, "CONNECT", "", transmit_file_ready_match_cb);
 MODEM_CHAT_MATCHES_DEFINE(delete_file_matches, ok_match, file_not_exist);
 
-// overwritten in write_modem_file
-static char del_file_cmd_buf[sizeof("AT+QFDEL=\"some_file_name_max\"")];
-static char upload_file_cmd_buf[sizeof("AT+QFUPL=\"some_file_name_max\",####")];
+enum upload_files_dynamic_cmd
+{
+    // AT+QFDEL=<file_name>
+    DYNAMIC_CMD_DELETE_FILE = 0,
+    // AT+QFUPL=<file_name>,<size>
+    DYNAMIC_CMD_UPLOAD_FILE = 1,
+};
 
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_upload_file_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP_MULT(del_file_cmd_buf, delete_file_matches),
-                              MODEM_CHAT_SCRIPT_CMD_RESP(upload_file_cmd_buf, upload_file_match),
+                              /*               AT+QFDEL=<file_name>  =>  OK or +CME ERROR: 405 (file not found)  */
+                              MODEM_CHAT_SCRIPT_CMD_RESP_MULT(dynamic_cmd_buffers[DYNAMIC_CMD_DELETE_FILE], delete_file_matches),
+                              /*               AT+QFUPL=<file_name>  =>   CONNECT   */
+                              MODEM_CHAT_SCRIPT_CMD_RESP(dynamic_cmd_buffers[DYNAMIC_CMD_UPLOAD_FILE], upload_file_match),
+                              /*              WAIT FOR => +QFUPL: <size>,<checksum> */
                               MODEM_CHAT_SCRIPT_CMD_RESP("", upload_finish_match));
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_upload_file_chat_script, bg9x_ssl_upload_file_chat_script_cmds,
@@ -506,14 +518,14 @@ static int write_modem_file(struct bg9x_ssl_modem_data *data, const char *name, 
         return 0;
     }
 
-    if (!file || !name || strlen(name) > sizeof("some_file_name_max"))
+    if (!file || !name)
     {
         LOG_ERR("write modem file invalid arguments");
         return -EINVAL;
     }
 
-    snprintk(del_file_cmd_buf, sizeof(del_file_cmd_buf), "AT+QFDEL=\"%s\"", name);
-    snprintk(upload_file_cmd_buf, sizeof(upload_file_cmd_buf), "AT+QFUPL=\"%s\",%d", name, size);
+    snprintk(dynamic_cmd_buffers[DYNAMIC_CMD_DELETE_FILE], DYNAMIC_CMD_BUFFER_LEN, "AT+QFDEL=\"%s\"", name);
+    snprintk(dynamic_cmd_buffers[DYNAMIC_CMD_UPLOAD_FILE], DYNAMIC_CMD_BUFFER_LEN, "AT+QFUPL=\"%s\",%d", name, size);
 
     data->data_to_upload = file;
     data->data_to_upload_size = size;
@@ -744,10 +756,9 @@ static void resolve_dns_match_cb(struct modem_chat *chat, char **argv, uint16_t 
     }
 }
 
-// overwritten in modem_dns_resolve functions
-static char dns_resolve_cmd_buf[sizeof("AT+QIDNSGIP=1,\"some_host_name_url_max#############\"")];
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_resolve_dns_chat_script_cmds,
-                              MODEM_CHAT_SCRIPT_CMD_RESP(dns_resolve_cmd_buf, ok_match));
+                              /* AT+QIDNSGIP=1,"www.example.com" => OK (Then wait for unsolicited +QIURC: "dnsgip")  */
+                              MODEM_CHAT_SCRIPT_CMD_RESP(dynamic_cmd_buffers[0], ok_match));
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_resolve_dns_chat_script, bg9x_ssl_resolve_dns_chat_script_cmds,
                          abort_matches, bg9x_ssl_chat_callback_handler, 5);
@@ -757,7 +768,7 @@ static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *ho
 {
     int ret;
 
-    if (!resp || !host_req || strlen(host_req) > sizeof(dns_resolve_cmd_buf))
+    if (!resp || !host_req)
     {
         LOG_ERR("DNS resolve invalid arguments");
         return -EINVAL;
@@ -767,7 +778,7 @@ static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *ho
     data->expected_addr_count = 0;
 
     // create request and run
-    snprintk(dns_resolve_cmd_buf, sizeof(dns_resolve_cmd_buf), "AT+QIDNSGIP=1,\"%s\"", host_req);
+    snprintk(dynamic_cmd_buffers[0], DYNAMIC_CMD_BUFFER_LEN, "AT+QIDNSGIP=1,\"%s\"", host_req);
     ret = modem_run_script_and_wait(data, &bg9x_ssl_resolve_dns_chat_script);
     if (ret != 0)
         return ret;
@@ -780,6 +791,7 @@ static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *ho
         return ret < 0 ? ret : -EIO;
     }
 
+    // check that we have any addresses
     if (data->last_resolved_addr_info == NULL)
     {
         LOG_ERR("DNS resolve failed");
@@ -916,10 +928,10 @@ static void qsslopen_match_cb(struct modem_chat *chat, char **argv, uint16_t arg
 
 MODEM_CHAT_MATCH_DEFINE(qsslopen_match, "+QSSLOPEN: ", ",", qsslopen_match_cb);
 
-// AT+QSSLOPEN=<pdpctxID>,<sslctxID>,<clientID>,<serveraddr>,<port>[,<access_mode>]
-char socket_open_cmd_buf[sizeof("AT+QSSLOPEN:#,##,##\"255.255.255.255\",####,#")];
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_open_socket_chat_script_cmds,
-                              MODEM_CHAT_SCRIPT_CMD_RESP(socket_open_cmd_buf, ok_match),
+                              /* AT+QSSLOPEN=<pdpctxID>,<sslctxID>,<clientID>,<serveraddr>,<port>[,<access_mode>]  => OK */
+                              MODEM_CHAT_SCRIPT_CMD_RESP(dynamic_cmd_buffers[0], ok_match),
+                              /* Then wait for +QSSLOPEN: <err_code>          */
                               MODEM_CHAT_SCRIPT_CMD_RESP("", qsslopen_match), );
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_open_socket_chat_script, bg9x_open_socket_chat_script_cmds,
@@ -944,7 +956,7 @@ static int bg9x_ssl_open_socket(struct bg9x_ssl_modem_data *data, const char *ip
     }
 
     LOG_INF("socket connect to %s:%d requested...", ip, port);
-    snprintk(socket_open_cmd_buf, sizeof(socket_open_cmd_buf), "AT+QSSLOPEN=1,1,1,\"%s\",%d,%d", ip, port, QUECTEL_BUFFER_ACCESS_MODE);
+    snprintk(dynamic_cmd_buffers[0], DYNAMIC_CMD_BUFFER_LEN, "AT+QSSLOPEN=1,1,1,\"%s\",%d,%d", ip, port, QUECTEL_BUFFER_ACCESS_MODE);
     ret = modem_run_script_and_wait(data, &bg9x_open_socket_chat_script);
     if (ret != MODEM_CHAT_SCRIPT_RESULT_SUCCESS)
     {
@@ -1157,9 +1169,10 @@ MODEM_CHAT_MATCH_DEFINE(send_ok_match, "SEND OK", "", send_success_match_cb);
 MODEM_CHAT_MATCH_DEFINE(send_fail_match, "SEND FAIL", "", send_fail_match_cb);
 MODEM_CHAT_MATCHES_DEFINE(send_result_matchs, send_ok_match, send_fail_match);
 
-char socket_send_cmd_buf[sizeof("AT+QSSLSEND=##,####\r\n")];
+// AT+QSSLSEND=1,<size>
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_send_chat_script_cmds,
-                              MODEM_CHAT_SCRIPT_CMD_RESP_NONE(socket_send_cmd_buf, 100),
+                              /*                              AT+QSSLSEND=1,<size>       */
+                              MODEM_CHAT_SCRIPT_CMD_RESP_NONE(dynamic_cmd_buffers[0], 100),
                               MODEM_CHAT_SCRIPT_CMD_RESP_MULT("", send_result_matchs), );
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_send_chat_script, bg9x_ssl_send_chat_script_cmds,
@@ -1179,7 +1192,7 @@ static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t 
     LOG_INF("socket send with len %d requested", len);
 
     // transmit send request
-    snprintk(socket_send_cmd_buf, sizeof(socket_open_cmd_buf), "AT+QSSLSEND=1,%d", len);
+    snprintk(dynamic_cmd_buffers[0], DYNAMIC_CMD_BUFFER_LEN, "AT+QSSLSEND=1,%d", len);
     ret = modem_chat_script_run(&data->chat, &bg9x_ssl_send_chat_script);
     if (ret != 0)
     {
@@ -1410,7 +1423,6 @@ void pipe_recv_cb(struct modem_pipe *pipe, enum modem_pipe_event event,
 static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, size_t requested_size)
 {
     int ret;
-    char socket_recv_cmd_buf[sizeof("AT+QSSLRECV=##,####")];
     bool connection_reset_occured = false;
     bool recv_data_ready_occured = false;
     size_t recv_buf_ability = sizeof(data->uart_backend_receive_buf) - RECV_BUFFER_METADATA_SIZE;
@@ -1433,9 +1445,9 @@ static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, 
     data->pipe_recv_total = 0;
 
     // send request for reading data with the size of the receiving buffer plus header and footer
-    snprintk(socket_recv_cmd_buf, sizeof(socket_recv_cmd_buf), "AT+QSSLRECV=1,%d\r", max_len);
-    LOG_DBG("Sending %s...", socket_recv_cmd_buf);
-    ret = modem_pipe_transmit(data->uart_pipe, socket_recv_cmd_buf, strlen(socket_recv_cmd_buf));
+    LOG_DBG("Sending %s...", dynamic_cmd_buffers[0]);
+    snprintk(dynamic_cmd_buffers[0], DYNAMIC_CMD_BUFFER_LEN, "AT+QSSLRECV=1,%d\r", max_len);
+    ret = modem_pipe_transmit(data->uart_pipe, dynamic_cmd_buffers[0], strlen(dynamic_cmd_buffers[0]));
     if (ret < 0)
     {
         LOG_ERR("Failed to transmit QSSLRECV: %d", ret);
@@ -2157,7 +2169,7 @@ PM_DEVICE_DT_INST_DEFINE(0, bg9x_ssl_pm_action);
 NET_DEVICE_DT_INST_OFFLOAD_DEFINE(0, bg9x_ssl_init, PM_DEVICE_DT_INST_GET(0),
                                   &modem_data, &modem_config,
                                   80, // priority copied from bg9x_modem
-                                  &api_funcs, MODEM_MAX_DATA_LENGTH);
+                                  &api_funcs, MODEM_MAX_DATA_LEN);
 
 /* Register NET sockets. */
 NET_SOCKET_OFFLOAD_REGISTER(quectel_bg9x_ssl, CONFIG_NET_SOCKETS_OFFLOAD_PRIORITY,
