@@ -17,6 +17,8 @@
 #include <zephyr/pm/device_runtime.h>
 #include <zephyr/net/mqtt.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/net/conn_mgr_monitor.h>
+#include <zephyr/net/conn_mgr_connectivity.h>
 
 LOG_MODULE_REGISTER(MAIN);
 
@@ -394,6 +396,9 @@ static int start_app(void)
 {
 
 	int ret;
+	uint32_t raised_event;
+	const void *info;
+	size_t info_len;
 
 	LOG_INF("Powering on modem");
 	ret = pm_device_action_run(modem, PM_DEVICE_ACTION_RESUME);
@@ -403,8 +408,44 @@ static int start_app(void)
 		return -1;
 	}
 
+	ret = conn_mgr_all_if_up(true);
+	if (ret != 0)
+	{
+		LOG_ERR("Failed to bring up network interface");
+		return ret;
+	}
+
+	LOG_INF("Waiting for L4 connected");
+	ret = net_mgmt_event_wait_on_iface(net_if_get_default(),
+									   NET_EVENT_L4_CONNECTED, &raised_event, &info,
+									   &info_len, K_SECONDS(120));
+	if (ret != 0)
+	{
+		LOG_ERR("L4 was not connected in time");
+		return ret;
+	}
+
+	LOG_INF("Publishing");
 	ret = publisher();
 	PRINT_RESULT("publisher returned", ret);
+
+	LOG_INF("Disconnecting");
+	ret = conn_mgr_all_if_disconnect(true);
+	if (ret != 0)
+	{
+		LOG_ERR("Failed to bring up network interface");
+		return ret;
+	}
+
+	// wait for the network to go down
+	k_sleep(K_SECONDS(2));
+
+	ret = conn_mgr_all_if_down(true);
+	if (ret != 0)
+	{
+		LOG_ERR("Failed to bring up network interface");
+		return ret;
+	}
 
 	LOG_INF("Powering off modem");
 	ret = pm_device_action_run(modem, PM_DEVICE_ACTION_SUSPEND);

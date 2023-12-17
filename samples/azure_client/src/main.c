@@ -18,11 +18,17 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/devicetree.h>
+#include <zephyr/net/conn_mgr_monitor.h>
+#include <zephyr/net/conn_mgr_connectivity.h>
 
 #include <cJSON.h>
 #include <cJSON_os.h>
 
 LOG_MODULE_REGISTER(MAIN);
+
+/* Macros used to subscribe to specific Zephyr net management events. */
+#define L4_EVENT_MASK (NET_EVENT_L4_CONNECTED | NET_EVENT_L4_DISCONNECTED)
+#define CONN_LAYER_EVENT_MASK (NET_EVENT_CONN_IF_FATAL_ERROR)
 
 /* Interval [s] between sending events to the IoT hub. The value can be changed
  * by setting a new desired value for property 'telemetryInterval' in the
@@ -31,6 +37,10 @@ LOG_MODULE_REGISTER(MAIN);
 #define EVENT_INTERVAL 20
 #define RECV_BUF_SIZE 1024
 #define APP_WORK_Q_STACK_SIZE KB(8)
+
+/* Zephyr net management event callback structures. */
+static struct net_mgmt_event_callback l4_cb;
+static struct net_mgmt_event_callback conn_cb;
 
 static const struct device *modem = DEVICE_DT_GET(DT_ALIAS(modem));
 
@@ -47,6 +57,7 @@ static struct k_work_delayable reboot_work;
 
 static char recv_buf[RECV_BUF_SIZE];
 static void direct_method_handler(struct k_work *work);
+static K_SEM_DEFINE(network_connected_sem, 0, 1);
 static K_SEM_DEFINE(recv_buf_sem, 1, 1);
 static atomic_t event_interval = EVENT_INTERVAL;
 
@@ -438,6 +449,47 @@ static void twin_report_work_fn(struct k_work *work)
 	LOG_INF("New telemetry interval has been applied: %d", new_interval);
 }
 
+static void on_net_event_l4_connected(void)
+{
+	k_sem_give(&network_connected_sem);
+}
+
+static void on_net_event_l4_disconnected(void)
+{
+	(void)azure_iot_hub_disconnect();
+}
+
+static void l4_event_handler(struct net_mgmt_event_callback *cb,
+							 uint32_t event,
+							 struct net_if *iface)
+{
+	switch (event)
+	{
+	case NET_EVENT_L4_CONNECTED:
+		LOG_INF("Network connectivity established and IP address assigned");
+		on_net_event_l4_connected();
+		break;
+	case NET_EVENT_L4_DISCONNECTED:
+		LOG_INF("Network connectivity lost, no IP address assigned");
+		on_net_event_l4_disconnected();
+		break;
+	default:
+		return;
+	}
+}
+
+static void connectivity_event_handler(struct net_mgmt_event_callback *cb,
+									   uint32_t event,
+									   struct net_if *iface)
+{
+	if (event == NET_EVENT_CONN_IF_FATAL_ERROR)
+	{
+		LOG_ERR("Fatal error received from the connectivity layer, rebooting");
+		sys_reboot(SYS_REBOOT_COLD);
+		CODE_UNREACHABLE;
+	}
+}
+
 static void work_init(void)
 {
 	k_work_init(&method_data.work, direct_method_handler);
@@ -451,9 +503,10 @@ static void work_init(void)
 
 int main(void)
 {
-	int err;
+	int ret;
 	char hostname[128] = CONFIG_AZURE_IOT_HUB_HOSTNAME;
 	char device_id[128] = CONFIG_AZURE_IOT_HUB_DEVICE_ID;
+
 	struct azure_iot_hub_config cfg = {
 		.device_id = {
 			.ptr = device_id,
@@ -470,39 +523,55 @@ int main(void)
 	LOG_INF("Device ID: %s", device_id);
 	LOG_INF("Host name: %s", hostname);
 
+	/* Setup handler for Zephyr NET Connection Manager events. */
+	net_mgmt_init_event_callback(&l4_cb, l4_event_handler, L4_EVENT_MASK);
+	net_mgmt_add_event_callback(&l4_cb);
+
+	/* Setup handler for Zephyr NET Connection Manager Connectivity layer. */
+	net_mgmt_init_event_callback(&conn_cb, connectivity_event_handler, CONN_LAYER_EVENT_MASK);
+	net_mgmt_add_event_callback(&conn_cb);
+
 	LOG_INF("Bringing network interface up and connecting to the network");
 
 	certificates_provision();
 
 	//  ====================== MODEM UP ======================
 	LOG_INF("Powering on modem");
-	int ret = pm_device_action_run(modem, PM_DEVICE_ACTION_RESUME);
+	ret = pm_device_action_run(modem, PM_DEVICE_ACTION_RESUME);
 	if (ret < 0)
 	{
 		LOG_ERR("Failed to power up modem: %d", ret);
 		return -1;
 	}
 
-	// =======================================================
+	ret = conn_mgr_all_if_up(true);
+	if (ret)
+	{
+		LOG_ERR("conn_mgr_if_connect, error: %d", ret);
+		return ret;
+	}
+
+	LOG_INF("Waiting for L4 connected");
+	k_sem_take(&network_connected_sem, K_FOREVER);
 
 	LOG_INF("Connected to network");
 
 	work_init();
 	cJSON_Init();
 
-	err = azure_iot_hub_init(azure_event_handler);
-	if (err)
+	ret = azure_iot_hub_init(azure_event_handler);
+	if (ret)
 	{
-		LOG_ERR("Azure IoT Hub could not be initialized, error: %d", err);
+		LOG_ERR("Azure IoT Hub could not be initialized, error: %d", ret);
 		return 0;
 	}
 
 	LOG_INF("Azure IoT Hub library initialized");
 
-	err = azure_iot_hub_connect(&cfg);
-	if (err < 0)
+	ret = azure_iot_hub_connect(&cfg);
+	if (ret < 0)
 	{
-		LOG_ERR("azure_iot_hub_connect failed: %d", err);
+		LOG_ERR("azure_iot_hub_connect failed: %d", ret);
 		return 0;
 	}
 

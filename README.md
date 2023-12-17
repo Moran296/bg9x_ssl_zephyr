@@ -3,8 +3,10 @@
 *Note: This repository is a work in progress*
 
 ## Overview
-
 This repository contains the out of tree BG9x modem driver with SSL socket offloading for Zephyr RTOS.
+
+This means that the modem takes care of layers 1-4 of the OSI model, plus the SSL layer, instead of using native Zephyr sockets with MBEDTLS for SSL. The driver is using net socket offload to allow transparent use of the modem as a network interface. Currently only one socket at a time is supported, this is usually enough for IoT applications such as Azure IoT Hub and other MQTT brokers.
+
 ### This includes the next features:
 - SSL socket offloading as a Zephyr network interface
 - CA certificate, client certificate and client key file upload to the modem
@@ -14,7 +16,7 @@ This repository contains the out of tree BG9x modem driver with SSL socket offlo
 - PM device power management support
 - DNS resolve offloading support (getaddrinfo)
 - Kconfig support for cert and key file path auto provisioning
-- Sync behavior - all API is blocking (socket can be configured as non-blocking and polled)
+- connectivity manager support (conn_mgr) - currently connect and disconnect only
 - Two samples are included:
   - MQTT publisher sample (test.mosquitto.org)
   - Azure IOT Hub sample application using NRF IOT Hub library
@@ -23,8 +25,9 @@ Also included is a sample application that demonstrates the driver. Currently th
 Zephyr's MQTT publisher sample with SSL socket offloading.
 
 ### TODO features
+- [ ] Connectivity manager setopt and getopt to allow user to set the modem's APN and connection perferences
 - [ ] Aquire modem info on startup (IMEI, IMSI, etc.)
-- [ ] More than one socket at a time
+- [ ] More than one socket at a time (low priority as it is not required for MQTT/IoT Hub)
 - [ ] Test and use with BG96
 - [ ] HTTPS sample application
 

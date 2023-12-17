@@ -9,7 +9,9 @@ config BG9X_MODEM_SSL
   select NETWORKING
   select NET_SOCKETS
 	select NET_SOCKETS_OFFLOAD
-  select DNS_RESOLVER
+  select NET_IPV4
+  select NET_CONNECTION_MANAGER
+  select TLS_CREDENTIALS
 	depends on DT_HAS_QUECTEL_BG95_ENABLED
 	help
 	  This driver implements a modem driver for the BG9X
