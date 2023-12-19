@@ -893,7 +893,10 @@ static void disconnect_script_cb(struct modem_chat *chat,
                                  void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
-    net_if_ipv4_addr_rm(data->net_iface, &data->ipv4addr);
+
+    data->ipv4addr.s_addr = 0;
+    LOG_INF("Modem notify ipv4 addr del");
+    net_mgmt_event_notify(NET_EVENT_IPV4_ADDR_DEL, data->net_iface);
 
     LOG_INF("Modem disconnected!");
 }
@@ -1980,15 +1983,10 @@ static void modem_net_iface_init(struct net_if *iface)
 
 static void connection_init_finish(struct bg9x_ssl_modem_data *data)
 {
-    net_if_set_link_addr(data->net_iface, data->imei,
-                         ARRAY_SIZE(data->imei), NET_LINK_UNKNOWN);
-
-    if (!net_if_ipv4_addr_add(data->net_iface,
-                              &data->ipv4addr,
-                              NET_ADDR_MANUAL,
-                              0))
+    if (data->ipv4addr.s_addr != 0)
     {
-        LOG_ERR("Failed to add IP address to interface");
+        LOG_INF("Modem notify ipv4 addr add");
+        net_mgmt_event_notify(NET_EVENT_IPV4_ADDR_ADD, data->net_iface);
     }
 
     data->modem_initialized = true;
