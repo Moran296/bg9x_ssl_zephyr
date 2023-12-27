@@ -35,7 +35,9 @@ LOG_MODULE_REGISTER(modem_quectel_bg9x_ssl, CONFIG_MODEM_LOG_LEVEL);
 #define QUECTEL_BUFFER_ACCESS_MODE 0
 #define QUECTEL_CME_ERR_FILE_DOES_NOT_EXIST "+CME ERROR: 405"
 
-#define MODEM_MAX_DATA_LEN 1024
+#define MODEM_RECEIVE_BUFFER_LEN 4096
+#define MODEM_TRANSMIT_BUFFER_LEN 1024
+#define MODEM_MTU_LEN 1500
 #define DYNAMIC_CMD_BUFFER_LEN 64
 #define DYNAMIC_CMD_MAX 3
 #define CA_FILE_NAME "ca_file"
@@ -146,8 +148,8 @@ struct bg9x_ssl_modem_data
     // uart backend
     struct modem_pipe *uart_pipe;
     struct modem_backend_uart uart_backend;
-    uint8_t uart_backend_receive_buf[MODEM_MAX_DATA_LEN];
-    uint8_t uart_backend_transmit_buf[MODEM_MAX_DATA_LEN];
+    char uart_backend_receive_buf[MODEM_RECEIVE_BUFFER_LEN];
+    char uart_backend_transmit_buf[MODEM_TRANSMIT_BUFFER_LEN];
 
     // chat data
     struct modem_chat chat;
@@ -1388,20 +1390,20 @@ void pipe_recv_cb(struct modem_pipe *pipe, enum modem_pipe_event event,
                   void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
-    int ret;
+    int ret = 0;
 
     switch (event)
     {
     case MODEM_PIPE_EVENT_RECEIVE_READY:
-
         ret = modem_pipe_receive(pipe,
                                  data->data_to_receive + data->pipe_recv_total,
-                                 sizeof(data->uart_backend_receive_buf) - data->pipe_recv_total);
+                                 data->data_to_receive_size - data->pipe_recv_total);
 
         if (ret < 0)
         {
             LOG_ERR("Pipe failed to receive data: %d", ret);
             notify_modem_error(data, MODEM_EVENT_SCRIPT, SCRIPT_STATE_UNKNOWN);
+            break;
         }
 
         LOG_DBG("pipe received %d bytes", ret);
@@ -1415,7 +1417,6 @@ void pipe_recv_cb(struct modem_pipe *pipe, enum modem_pipe_event event,
             modem_chat_attach(&data->chat, data->uart_pipe);
 
             notify_modem_success(data, MODEM_EVENT_SCRIPT, SCRIPT_RECV_STATE_FINISHED);
-            return;
         }
 
         break;
@@ -1430,8 +1431,10 @@ static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, 
     int ret;
     bool connection_reset_occured = false;
     bool recv_data_ready_occured = false;
+
     size_t recv_buf_ability = sizeof(data->uart_backend_receive_buf) - RECV_BUFFER_METADATA_SIZE;
-    size_t max_len = requested_size > recv_buf_ability ? recv_buf_ability : requested_size;
+    size_t max_request_size = MIN(MIN(requested_size, recv_buf_ability), MODEM_MTU_LEN);
+    size_t buffer_required_size = max_request_size + RECV_BUFFER_METADATA_SIZE;
 
     if (data->socket_state != SSL_SOCKET_STATE_CONNECTED)
     {
@@ -1439,19 +1442,20 @@ static int bg9x_ssl_socket_recv(struct bg9x_ssl_modem_data *data, uint8_t *buf, 
         return 0;
     }
 
-    LOG_INF("recv with %d size requested", requested_size);
-
+    LOG_INF("recv with %d size requested, asking for %d", requested_size, max_request_size);
     // ========= pipe detached mode, must reattach before function exit =========
     modem_chat_release(&data->chat);
     modem_pipe_attach(data->uart_pipe, pipe_recv_cb, data);
 
     data->data_to_receive = buf;
-    data->data_to_receive_size = max_len;
+    data->data_to_receive_size = buffer_required_size;
     data->pipe_recv_total = 0;
 
+    memset(data->data_to_receive, 0, buffer_required_size);
+
     // send request for reading data with the size of the receiving buffer plus header and footer
+    snprintk(dynamic_cmd_buffers[0], DYNAMIC_CMD_BUFFER_LEN, "AT+QSSLRECV=1,%d\r", max_request_size);
     LOG_DBG("Sending %s...", dynamic_cmd_buffers[0]);
-    snprintk(dynamic_cmd_buffers[0], DYNAMIC_CMD_BUFFER_LEN, "AT+QSSLRECV=1,%d\r", max_len);
     ret = modem_pipe_transmit(data->uart_pipe, dynamic_cmd_buffers[0], strlen(dynamic_cmd_buffers[0]));
     if (ret < 0)
     {
@@ -2310,7 +2314,7 @@ PM_DEVICE_DT_INST_DEFINE(0, bg9x_ssl_pm_action);
 NET_DEVICE_DT_INST_OFFLOAD_DEFINE(0, bg9x_ssl_init, PM_DEVICE_DT_INST_GET(0),
                                   &modem_data, &modem_config,
                                   80, // priority copied from bg9x_modem
-                                  &api_funcs, MODEM_MAX_DATA_LEN);
+                                  &api_funcs, MODEM_MTU_LEN);
 
 /* Register NET sockets. */
 NET_SOCKET_OFFLOAD_REGISTER(quectel_bg9x_ssl, CONFIG_NET_SOCKETS_OFFLOAD_PRIORITY,
