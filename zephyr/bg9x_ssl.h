@@ -1,6 +1,8 @@
 #ifndef BG9X_SSL_H
 #define BG9X_SSL_H
 
+#include <zephyr/modem/chat.h>
+
 #ifdef __cplusplus
 extern "C"
 {
