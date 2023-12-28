@@ -2445,4 +2445,36 @@ NET_SOCKET_OFFLOAD_REGISTER(quectel_bg9x_ssl, CONFIG_NET_SOCKETS_OFFLOAD_PRIORIT
 CONN_MGR_CONN_DEFINE(BG9X_SSL_CONNECTIVITY, &conn_api);
 CONN_MGR_BIND_CONN(NET_IF_DEV_NAME, BG9X_SSL_CONNECTIVITY);
 
-/* =========================== Device Init ============================================= */
+/* ===================== Additional Modem Commands ================================== */
+
+struct modem_chat *user_chat = NULL;
+
+void bg9x_control_attach_user_chat(struct modem_chat *chat)
+{
+    k_mutex_lock(&modem_data.modem_mutex, K_FOREVER);
+
+    if (user_chat)
+    {
+        modem_chat_release(user_chat);
+    }
+
+    user_chat = chat;
+    modem_chat_release(&modem_data.chat);
+    modem_chat_attach(chat, modem_data.uart_pipe);
+
+    k_mutex_unlock(&modem_data.modem_mutex);
+}
+
+void bg9x_control_detach_user_chat(void)
+{
+    k_mutex_lock(&modem_data.modem_mutex, K_FOREVER);
+
+    if (user_chat)
+    {
+        modem_chat_release(user_chat);
+        modem_chat_attach(&modem_data.chat, modem_data.uart_pipe);
+        user_chat = NULL;
+    }
+
+    k_mutex_unlock(&modem_data.modem_mutex);
+}

@@ -34,6 +34,27 @@ extern "C"
         BG9X_SSL_CONNECTIVITY_NETWORK_MODE_LTE_ONLY = 3,
     };
 
+    // functions for using the BG9x modem uart pipe for different purposes
+
+    /*
+        @ brief:    attach a different chat to the modem uart pipe
+        @ param:    chat - pointer to a modem_chat struct
+        @ return:   none
+
+        @ note:     this detaches thessl chat from the modem uart pipe
+                    Afer finishing the chat, the ssl chat must be re-attached to the modem uart pipe
+    */
+    void bg9x_control_attach_user_chat(struct modem_chat *chat);
+
+    /*
+        @ brief:    detach the ssl chat from the modem uart pipe
+        @ param:    none
+        @ return:   none
+
+        @ note:     this attaches the default ssl chat to the modem uart pipe
+    */
+    void bg9x_control_detach_user_chat(void);
+
 #ifdef __cplusplus
 }
 #endif
