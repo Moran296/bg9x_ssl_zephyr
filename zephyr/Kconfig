@@ -22,6 +22,27 @@ if BG9X_MODEM_SSL
 config BG9X_SSL_MODEM_APN
 	string "APN"
 	default "internet"
+  help
+   The network apn to use for the SSL connection.
+   max length is 32 characters.
+
+config BG9X_SSL_MODEM_USERNAME
+	string "network username"
+	default ""
+  help
+   The network username to use for the SSL connection.
+   max length is 32 characters.
+
+config BG9X_SSL_MODEM_PASSWORD
+	string "network password"
+	default ""
+  help
+    The network password to use for the SSL connection.
+    max length is 32 characters.
+
+config BG9X_SSL_MODEM_NETWORK_TIMEOUT_SEC
+  int "Network timeout in seconds"
+  default 120
 
 config BG9X_SSL_MODEM_SECURITY_LEVEL
     int "SSL security level"

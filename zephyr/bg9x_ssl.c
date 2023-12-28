@@ -27,6 +27,7 @@
 #include <zephyr/net/net_offload.h>
 #include <zephyr/net/socket_offload.h>
 #include <zephyr/net/conn_mgr_connectivity_impl.h>
+#include "bg9x_ssl.h"
 
 LOG_MODULE_REGISTER(modem_quectel_bg9x_ssl, CONFIG_MODEM_LOG_LEVEL);
 
@@ -162,6 +163,12 @@ struct bg9x_ssl_modem_data
     uint8_t registration_status_gsm;
     uint8_t registration_status_gprs;
     uint8_t registration_status_lte;
+
+    // connectivity related
+    char apn[32];
+    char username[32];
+    char password[32];
+    enum bg9x_ssl_connectivity_network_mode network_mode;
 
     // certs
     const uint8_t *ca_cert;
@@ -805,9 +812,16 @@ static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *ho
  * ==============================================================================
  */
 
+void handle_network_mode_command(struct bg9x_ssl_modem_data *data)
+{
+    snprintk(dynamic_cmd_buffers[2], DYNAMIC_CMD_BUFFER_LEN, "AT+QCFG=\"nwscanseq\",%d", (int)data->network_mode);
+}
+
 /* Configure SSL paramters */
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_configure_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
+                              // not tested yet
+                              // MODEM_CHAT_SCRIPT_CMD_RESP(dynamic_cmd_buffers[2], ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"sslversion\",1,4", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"ciphersuite\",1,0xFFFF", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"negotiatetime\",1,300", ok_match),
@@ -821,6 +835,9 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_configure_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"clientkey\",1,\"" CLIENT_KEY_FILE_NAME "\"", ok_match),
 #endif
 );
+
+MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_configure_chat_script, bg9x_ssl_configure_chat_script_cmds,
+                         abort_matches, script_cb_with_finish_notification, 10);
 
 static void imei_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
                           void *user_data)
@@ -863,11 +880,14 @@ static void cgpaddr_match_cb(struct modem_chat *chat, char **argv, uint16_t argc
     LOG_DBG("IP address successfully parsed");
 }
 
+void handle_apn_command(struct bg9x_ssl_modem_data *data)
+{
+    snprintk(dynamic_cmd_buffers[0], DYNAMIC_CMD_BUFFER_LEN * 2, "AT+QICSGP=1,1,\"%s\",\"%s\",\"%s\",3",
+             data->apn, data->username, data->password);
+}
+
 MODEM_CHAT_MATCH_DEFINE(imei_match, "", "", imei_match_cb);
 MODEM_CHAT_MATCH_DEFINE(cgpaddr_match, "+CGPADDR", ",", cgpaddr_match_cb);
-
-MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_configure_chat_script, bg9x_ssl_configure_chat_script_cmds,
-                         abort_matches, script_cb_with_finish_notification, 10);
 
 /* Register to the network and activate ssl context */
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_register_chat_script_cmds,
@@ -880,7 +900,7 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_register_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CREG?", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGREG?", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG?", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QICSGP=1,1,\"" CONFIG_BG9X_SSL_MODEM_APN "\",\"\",\"\",3", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP(dynamic_cmd_buffers[0], ok_match), // AT+QICSGP apn, username, password
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGSN", imei_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGPADDR=1", cgpaddr_match),
@@ -888,7 +908,7 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_register_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QIACT=1", ok_match), );
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_register_chat_script, bg9x_ssl_register_chat_script_cmds,
-                         abort_matches, script_cb_with_finish_notification, 150);
+                         abort_matches, script_cb_with_finish_notification, CONFIG_BG9X_SSL_MODEM_NETWORK_TIMEOUT_SEC);
 
 static void disconnect_script_cb(struct modem_chat *chat,
                                  enum modem_chat_script_result result,
@@ -2016,6 +2036,7 @@ static void async_run_init_scripts_cb(struct modem_chat *chat,
         }
         else if (chat->script == &bg9x_ssl_configure_chat_script)
         {
+            handle_apn_command(data);
             next = &bg9x_ssl_register_chat_script;
         }
         else if (chat->script == &bg9x_ssl_register_chat_script)
@@ -2048,6 +2069,8 @@ static void async_run_init_scripts_cb(struct modem_chat *chat,
 
 int run_init_scripts(struct bg9x_ssl_modem_data *data)
 {
+    handle_network_mode_command(data);
+
     // if there are any files to upload, upload them, otherwise run configure ssl chat script
     struct modem_chat_script *first_script = prepare_next_modem_file(data) == true
                                                  ? &bg9x_ssl_upload_file_chat_script
@@ -2091,14 +2114,97 @@ int bg9x_ssl_connectivity_disconnect(struct conn_mgr_conn_binding *const if_conn
 int bg9x_ssl_connectivity_options_set(struct conn_mgr_conn_binding *const if_conn, int name,
                                       const void *value, size_t length)
 {
-    LOG_INF("bg9x_ssl_connectivity_options_set");
+    struct bg9x_ssl_modem_data *data = net_if_get_device(if_conn->iface)->data;
+    char *dest_str = NULL;
+    size_t dest_size;
+
+    LOG_INF("bg9x_ssl_connectivity_options_set with name %d", name);
+
+    switch (name)
+    {
+    case BG9X_SSL_CONNECTIVITY_APN:
+        dest_str = data->apn;
+        dest_size = sizeof(data->apn);
+        break;
+    case BG9X_SSL_CONNECTIVITY_USERNAME:
+        dest_str = data->username;
+        dest_size = sizeof(data->apn);
+        break;
+    case BG9X_SSL_CONNECTIVITY_PASSWORD:
+        dest_str = data->password;
+        dest_size = sizeof(data->apn);
+        break;
+    case BG9X_SSL_CONNECTIVITY_NETWORK_MODE:
+        data->network_mode = *(int *)value;
+        return 0;
+    default:
+        LOG_ERR("protocol option %d not supported", name);
+        return -ENOPROTOOPT;
+    }
+
+    if (dest_str != NULL)
+    {
+        if (!value || length == 0)
+        {
+            LOG_ERR("Invalid value");
+            return -EINVAL;
+        }
+
+        if (length > dest_size)
+        {
+            LOG_ERR("Value too long");
+            return -ENOBUFS;
+        }
+
+        memcpy(dest_str, value, length);
+    }
+
     return 0;
 }
 
 int bg9x_ssl_connectivity_options_get(struct conn_mgr_conn_binding *const if_conn, int name, void *value,
                                       size_t *length)
 {
-    LOG_INF("bg9x_ssl_connectivity_options_get");
+    struct bg9x_ssl_modem_data *data = net_if_get_device(if_conn->iface)->data;
+    char *src_str = NULL;
+    size_t src_size;
+
+    LOG_INF("bg9x_ssl_connectivity_options_get with name %d", name);
+
+    switch (name)
+    {
+    case BG9X_SSL_CONNECTIVITY_APN:
+        src_str = data->apn;
+        src_size = strlen(data->apn);
+        break;
+    case BG9X_SSL_CONNECTIVITY_USERNAME:
+        src_str = data->username;
+        src_size = strlen(data->apn);
+        break;
+    case BG9X_SSL_CONNECTIVITY_PASSWORD:
+        src_str = data->password;
+        src_size = strlen(data->apn);
+        break;
+    case BG9X_SSL_CONNECTIVITY_NETWORK_MODE:
+        *(int *)value = data->network_mode;
+        return 0;
+    default:
+        LOG_ERR("protocol option %d not supported", name);
+        return -ENOPROTOOPT;
+    }
+
+    if (src_str != NULL)
+    {
+        if (!value)
+        {
+            LOG_ERR("Invalid value");
+            return -EINVAL;
+        }
+
+        memcpy(value, src_str, src_size);
+        *length = src_size;
+    }
+
     return 0;
 }
 
@@ -2211,6 +2317,19 @@ static int bg9x_ssl_init(const struct device *dev)
     struct bg9x_ssl_modem_config *config = (struct bg9x_ssl_modem_config *)dev->config;
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)dev->data;
     data->modem_initialized = false;
+
+    // connectivity params
+    data->network_mode = BG9X_SSL_CONNECTIVITY_NETWORK_MODE_AUTO;
+
+    memset(data->apn, 0, sizeof(data->apn));
+    memset(data->username, 0, sizeof(data->username));
+    memset(data->password, 0, sizeof(data->password));
+    __ASSERT_NO_MSG(strlen(CONFIG_BG9X_SSL_MODEM_APN) < sizeof(data->apn));
+    memcpy(data->apn, CONFIG_BG9X_SSL_MODEM_APN, strlen(CONFIG_BG9X_SSL_MODEM_APN));
+    __ASSERT_NO_MSG(strlen(CONFIG_BG9X_SSL_MODEM_USERNAME) < sizeof(data->username));
+    memcpy(data->username, CONFIG_BG9X_SSL_MODEM_USERNAME, strlen(CONFIG_BG9X_SSL_MODEM_USERNAME));
+    __ASSERT_NO_MSG(strlen(CONFIG_BG9X_SSL_MODEM_PASSWORD) < sizeof(data->password));
+    memcpy(data->password, CONFIG_BG9X_SSL_MODEM_PASSWORD, strlen(CONFIG_BG9X_SSL_MODEM_PASSWORD));
 
     gpio_pin_configure_dt(&config->power_gpio, GPIO_OUTPUT_INACTIVE);
 

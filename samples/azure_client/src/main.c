@@ -20,6 +20,7 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/net/conn_mgr_monitor.h>
 #include <zephyr/net/conn_mgr_connectivity.h>
+#include "bg9x_ssl.h"
 
 #include <cJSON.h>
 #include <cJSON_os.h>
@@ -534,6 +535,7 @@ int main(void)
 	LOG_INF("Bringing network interface up and connecting to the network");
 
 	certificates_provision();
+	conn_mgr_if_set_opt(net_if_get_default(), BG9X_SSL_CONNECTIVITY_APN, "internet", strlen("internet"));
 
 	//  ====================== MODEM UP ======================
 	LOG_INF("Powering on modem");
