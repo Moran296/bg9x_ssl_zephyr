@@ -39,7 +39,7 @@ LOG_MODULE_REGISTER(modem_quectel_bg9x_ssl, CONFIG_MODEM_LOG_LEVEL);
 #define MODEM_RECEIVE_BUFFER_LEN 4096
 #define MODEM_TRANSMIT_BUFFER_LEN 1024
 #define MODEM_MTU_LEN 1500
-#define DYNAMIC_CMD_BUFFER_LEN 64
+#define DYNAMIC_CMD_BUFFER_LEN 128
 #define DYNAMIC_CMD_MAX 3
 #define CA_FILE_NAME "ca_file"
 #define CLIENT_CERT_FILE_NAME "cl_c_file"
@@ -143,8 +143,7 @@ struct bg9x_ssl_modem_data
     // net interface related
     struct net_if *net_iface;
     bool modem_initialized;
-    char imei[16];
-    struct in_addr ipv4addr;
+    struct modem_connection_info connection_info;
 
     // uart backend
     struct modem_pipe *uart_pipe;
@@ -337,13 +336,13 @@ static int modem_run_script_and_wait(struct bg9x_ssl_modem_data *data,
     return wait_on_modem_event(data, MODEM_EVENT_SCRIPT, K_FOREVER);
 }
 
-void on_event_registered(struct bg9x_ssl_modem_data *data)
+static void on_event_registered(struct bg9x_ssl_modem_data *data)
 {
     LOG_INF("~*~*~Modem Registered~*~*~");
     net_if_dormant_off(data->net_iface);
 }
 
-void on_event_lost_registration(struct bg9x_ssl_modem_data *data)
+static void on_event_lost_registration(struct bg9x_ssl_modem_data *data)
 {
     LOG_INF("<><><>Modem Unregistered<><><>");
     net_if_dormant_on(data->net_iface);
@@ -812,16 +811,9 @@ static int bg9x_ssl_dns_resolve(struct bg9x_ssl_modem_data *data, const char *ho
  * ==============================================================================
  */
 
-void handle_network_mode_command(struct bg9x_ssl_modem_data *data)
-{
-    snprintk(dynamic_cmd_buffers[2], DYNAMIC_CMD_BUFFER_LEN, "AT+QCFG=\"nwscanseq\",%d", (int)data->network_mode);
-}
-
 /* Configure SSL paramters */
 MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_configure_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
-                              // not tested yet
-                              // MODEM_CHAT_SCRIPT_CMD_RESP(dynamic_cmd_buffers[2], ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"sslversion\",1,4", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"ciphersuite\",1,0xFFFF", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QSSLCFG=\"negotiatetime\",1,300", ok_match),
@@ -842,6 +834,7 @@ MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_configure_chat_script, bg9x_ssl_configure_chat
 static void imei_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
                           void *user_data)
 {
+    uint8_t i = 0;
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
 
     if (argc != 2)
@@ -854,10 +847,12 @@ static void imei_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
         return;
     }
 
-    for (uint8_t i = 0; i < 15; i++)
+    for (i = 0; i < 15; i++)
     {
-        data->imei[i] = argv[1][i] - '0';
+        data->connection_info.imei[i] = argv[1][i] - '0';
     }
+
+    data->connection_info.imei[i] = '\0';
 }
 
 static void cgpaddr_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
@@ -871,7 +866,7 @@ static void cgpaddr_match_cb(struct modem_chat *chat, char **argv, uint16_t argc
     }
 
     LOG_DBG("IP address response: %s", argv[2]);
-    if (net_addr_pton(AF_INET, argv[2], &data->ipv4addr) != 0)
+    if (net_addr_pton(AF_INET, argv[2], &data->connection_info.ipv4addr) != 0)
     {
         LOG_ERR("Invalid IP address");
         return;
@@ -880,13 +875,49 @@ static void cgpaddr_match_cb(struct modem_chat *chat, char **argv, uint16_t argc
     LOG_DBG("IP address successfully parsed");
 }
 
-void handle_apn_command(struct bg9x_ssl_modem_data *data)
+static void modem_cellular_chat_on_qccid(struct modem_chat *chat, char **argv, uint16_t argc,
+                                         void *user_data)
 {
-    snprintk(dynamic_cmd_buffers[0], DYNAMIC_CMD_BUFFER_LEN * 2, "AT+QICSGP=1,1,\"%s\",\"%s\",\"%s\",3",
-             data->apn, data->username, data->password);
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
+
+    if (argc != 2)
+    {
+        LOG_ERR("QCCID: missing argument. argc = %d", argc);
+        return;
+    }
+
+    memset(data->connection_info.iccid, 0, sizeof(data->connection_info.iccid));
+    strncpy(data->connection_info.iccid, argv[1], sizeof(data->connection_info.iccid) - 1);
+    LOG_INF("ICCID: %s", data->connection_info.iccid);
+}
+
+enum regiter_network_dynamic_cmds
+{
+    // AT+QICSGP=<pdp_type>,<context_id>,<apn>,<user_name>,<password>,<auth_type>
+    DYNAMIC_CMD_APN = 0,
+    // AT+QCFG="nwscanmode", <network_mode>
+    DYNAMIC_CMD_NETWORK_MODE = 1,
+};
+
+static void handle_apn_command(struct bg9x_ssl_modem_data *data)
+{
+    int would_write = snprintk(dynamic_cmd_buffers[DYNAMIC_CMD_APN], DYNAMIC_CMD_BUFFER_LEN, "AT+QICSGP=1,1,\"%s\",\"%s\",\"%s\",3",
+                               data->apn, data->username, data->password);
+
+    if (would_write >= DYNAMIC_CMD_BUFFER_LEN)
+    {
+        LOG_ERR("APN command too long");
+        __ASSERT_NO_MSG(false);
+    }
+}
+
+static void handle_network_mode_command(struct bg9x_ssl_modem_data *data)
+{
+    snprintk(dynamic_cmd_buffers[DYNAMIC_CMD_NETWORK_MODE], DYNAMIC_CMD_BUFFER_LEN, "AT+QCFG=\"nwscanmode\",%d", (int)data->network_mode);
 }
 
 MODEM_CHAT_MATCH_DEFINE(imei_match, "", "", imei_match_cb);
+MODEM_CHAT_MATCH_DEFINE(qccid_match, "+QCCID: ", "", modem_cellular_chat_on_qccid);
 MODEM_CHAT_MATCH_DEFINE(cgpaddr_match, "+CGPADDR", ",", cgpaddr_match_cb);
 
 /* Register to the network and activate ssl context */
@@ -894,14 +925,20 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_register_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("ATE0", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CPIN?", cpin_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CFUN=0", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP(dynamic_cmd_buffers[DYNAMIC_CMD_APN], ok_match),          // AT+QICSGP apn, username, password
+                              MODEM_CHAT_SCRIPT_CMD_RESP(dynamic_cmd_buffers[DYNAMIC_CMD_NETWORK_MODE], ok_match), // AT+QCFG="nwscanmode", <network_mode>
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+CFUN=1", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP_NONE("AT", 2500), // wait for CFUN=1 to take effect
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CREG=1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGREG=1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG=1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CREG?", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGREG?", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CEREG?", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP(dynamic_cmd_buffers[0], ok_match), // AT+QICSGP apn, username, password
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGSN", imei_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QCCID", qccid_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGPADDR=1", cgpaddr_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
@@ -910,13 +947,123 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_register_chat_script_cmds,
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_register_chat_script, bg9x_ssl_register_chat_script_cmds,
                          abort_matches, script_cb_with_finish_notification, CONFIG_BG9X_SSL_MODEM_NETWORK_TIMEOUT_SEC);
 
+/*
+ * =======================================================================
+ *                          MODEM GET CONNECTION INFO
+ * =======================================================================
+
+*/
+
+static void modem_cellular_chat_on_qcsq(struct modem_chat *chat, char **argv, uint16_t argc,
+                                        void *user_data)
+{
+    struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
+
+    if (argc < 3)
+    {
+        LOG_ERR("QCSQ: missing argument. argc = %d", argc);
+        data->connection_info.network_type = CELLULAR_NETWORK_NONE;
+
+        return;
+    }
+
+    if (strncmp(argv[1], "\"GSM\"", sizeof("\"GSM\"")) == 0)
+    {
+        data->connection_info.network_type = CELLULAR_NETWORK_GSM;
+    }
+    else if (strncmp(argv[1], "\"eMTC\"", sizeof("\"eMTC\"")) == 0)
+    {
+        data->connection_info.network_type = CELLULAR_NETWORK_LTE_M;
+    }
+    else if (strncmp(argv[1], "\"NBIoT\"", sizeof("\"NBIoT\"")) == 0)
+    {
+        data->connection_info.network_type = CELLULAR_NETWORK_NBIOT;
+    }
+    else
+    {
+        LOG_ERR("invalid network type: %s", argv[1]);
+        data->connection_info.network_type = CELLULAR_NETWORK_NONE;
+        return;
+    }
+
+    data->connection_info.rssi = atoi(argv[2]);
+    if (data->connection_info.network_type == CELLULAR_NETWORK_GSM)
+    {
+        // GSM only provides RSSI
+        data->connection_info.rsrp = 0;
+        data->connection_info.sinr = 0;
+        data->connection_info.rsrq = 0;
+        LOG_DBG("QCSQ: network type: GSM, rssi: %d", data->connection_info.rssi);
+        return;
+    }
+    else if (argc < 6)
+    {
+        LOG_ERR("QCSQ: missing argument for LTE network. argc = %d", argc);
+        return;
+    }
+
+    data->connection_info.rsrp = atoi(argv[3]);
+    data->connection_info.sinr = atoi(argv[4]);
+    data->connection_info.rsrq = atoi(argv[5]);
+    LOG_DBG("QCSQ: network type: %s, rssi: %d, rsrp: %d, sinr: %d, rsrq: %d", argv[1],
+            data->connection_info.rssi, data->connection_info.rsrp, data->connection_info.sinr,
+            data->connection_info.rsrq);
+}
+
+MODEM_CHAT_MATCH_DEFINE(qcsq_match, "+QCSQ: ", ",", modem_cellular_chat_on_qcsq);
+
+MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_fetch_info_chat_script_cmds,
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QCSQ", qcsq_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match), );
+
+MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_fetch_info_chat_script, bg9x_ssl_fetch_info_chat_script_cmds,
+                         abort_matches, script_cb_with_finish_notification, 5);
+
+int bg9x_ssl_get_connection_info(struct modem_connection_info *info)
+{
+    int ret = 0;
+
+    if (!info)
+    {
+        LOG_ERR("Invalid connection info pointer");
+        return;
+    }
+
+    struct bg9x_ssl_modem_data *data = &modem_data;
+    k_mutex_lock(&data->modem_mutex, K_FOREVER);
+    if (!bg9x_ssl_is_registered(data))
+    {
+        info->network_type = CELLULAR_NETWORK_NONE;
+        ret = -ENETDOWN;
+    }
+    else
+    {
+        memset(info, 0, sizeof(struct modem_connection_info));
+        ret = modem_run_script_and_wait(data, &bg9x_ssl_fetch_info_chat_script);
+        if (ret == MODEM_CHAT_SCRIPT_RESULT_SUCCESS)
+        {
+            memcpy(info, &data->connection_info, sizeof(struct modem_connection_info));
+        }
+    }
+
+    k_mutex_unlock(&data->modem_mutex);
+    return ret;
+}
+
+/*
+ * =======================================================================
+ *                          DISCONNECT FROM NETWORK
+ * =======================================================================
+
+*/
+
 static void disconnect_script_cb(struct modem_chat *chat,
                                  enum modem_chat_script_result result,
                                  void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
 
-    data->ipv4addr.s_addr = 0;
+    data->connection_info.ipv4addr.s_addr = 0;
     LOG_INF("Modem notify ipv4 addr del");
     net_mgmt_event_notify(NET_EVENT_IPV4_ADDR_DEL, data->net_iface);
 
@@ -1270,7 +1417,7 @@ static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t 
  */
 
 // check if buffer contains socket close
-bool is_recv_socket_close(struct bg9x_ssl_modem_data *data)
+static bool is_recv_socket_close(struct bg9x_ssl_modem_data *data)
 {
     size_t size = data->pipe_recv_total;
     const char *buf = data->data_to_receive;
@@ -1282,7 +1429,7 @@ bool is_recv_socket_close(struct bg9x_ssl_modem_data *data)
 }
 
 // check if buffer ends with "\r\n\r\nOK or \r\n+QSSLRECV: #\r\n"
-bool is_recv_finished(struct bg9x_ssl_modem_data *data)
+static bool is_recv_finished(struct bg9x_ssl_modem_data *data)
 {
     size_t size = data->pipe_recv_total;
     const char *buf = data->data_to_receive;
@@ -1295,7 +1442,7 @@ bool is_recv_finished(struct bg9x_ssl_modem_data *data)
     return read_end != NULL;
 }
 
-int parse_recv_size(const char *buf, size_t size)
+static int parse_recv_size(const char *buf, size_t size)
 {
     if (size < MIN_VALID_RECV_SIZE)
         return -EINVAL;
@@ -1318,7 +1465,7 @@ int parse_recv_size(const char *buf, size_t size)
     return len;
 }
 
-const char *get_recv_data_start_pos(const char *buf, size_t size)
+static const char *get_recv_data_start_pos(const char *buf, size_t size)
 {
     if (size < 20)
         return NULL;
@@ -1334,7 +1481,7 @@ const char *get_recv_data_start_pos(const char *buf, size_t size)
     return newline + 2;
 }
 
-bool is_recv_new_data_ready(struct bg9x_ssl_modem_data *data)
+static bool is_recv_new_data_ready(struct bg9x_ssl_modem_data *data)
 {
     return memmem(data->data_to_receive,
                   data->pipe_recv_total,
@@ -1342,7 +1489,7 @@ bool is_recv_new_data_ready(struct bg9x_ssl_modem_data *data)
                   strlen(UNSOL_RECV)) != NULL;
 }
 
-int parse_and_extract_recv_data(struct bg9x_ssl_modem_data *data)
+static int parse_and_extract_recv_data(struct bg9x_ssl_modem_data *data)
 {
     const char *start_pos;
     char *end_pos;
@@ -1406,8 +1553,8 @@ int parse_and_extract_recv_data(struct bg9x_ssl_modem_data *data)
     return actual_recv_size;
 }
 
-void pipe_recv_cb(struct modem_pipe *pipe, enum modem_pipe_event event,
-                  void *user_data)
+static void pipe_recv_cb(struct modem_pipe *pipe, enum modem_pipe_event event,
+                         void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
     int ret = 0;
@@ -1718,9 +1865,9 @@ static ssize_t offload_write(void *obj, const void *buffer, size_t count)
     return offload_sendto(obj, buffer, count, 0, NULL, 0);
 }
 
-int bg9x_ssl_getaddrinfo(const char *node, const char *service,
-                         const struct zsock_addrinfo *hints,
-                         struct zsock_addrinfo **res)
+static int bg9x_ssl_getaddrinfo(const char *node, const char *service,
+                                const struct zsock_addrinfo *hints,
+                                struct zsock_addrinfo **res)
 {
     int ret;
 
@@ -1753,7 +1900,7 @@ int bg9x_ssl_getaddrinfo(const char *node, const char *service,
     return ret;
 }
 
-void bg9x_ssl_freeaddrinfo(struct zsock_addrinfo *res)
+static void bg9x_ssl_freeaddrinfo(struct zsock_addrinfo *res)
 {
     if (res == NULL)
     {
@@ -1769,8 +1916,8 @@ void bg9x_ssl_freeaddrinfo(struct zsock_addrinfo *res)
     }
 }
 
-int ioctl_poll_prepare(struct bg9x_ssl_modem_data *data, struct zsock_pollfd *pfd, struct k_poll_event **pev,
-                       struct k_poll_event *pev_end)
+static int ioctl_poll_prepare(struct bg9x_ssl_modem_data *data, struct zsock_pollfd *pfd, struct k_poll_event **pev,
+                              struct k_poll_event *pev_end)
 {
     data->socket_blocking = false;
     if (pfd->events & ZSOCK_POLLIN)
@@ -1801,8 +1948,8 @@ int ioctl_poll_prepare(struct bg9x_ssl_modem_data *data, struct zsock_pollfd *pf
     return 0;
 }
 
-int ioctl_poll_update(struct zsock_pollfd *pfd,
-                      struct k_poll_event **pev)
+static int ioctl_poll_update(struct zsock_pollfd *pfd,
+                             struct k_poll_event **pev)
 {
     if (pfd->events & ZSOCK_POLLIN)
     {
@@ -2007,7 +2154,7 @@ static void modem_net_iface_init(struct net_if *iface)
 
 static void connection_init_finish(struct bg9x_ssl_modem_data *data)
 {
-    if (data->ipv4addr.s_addr != 0)
+    if (data->connection_info.ipv4addr.s_addr != 0)
     {
         LOG_INF("Modem notify ipv4 addr add");
         net_mgmt_event_notify(NET_EVENT_IPV4_ADDR_ADD, data->net_iface);
@@ -2036,6 +2183,7 @@ static void async_run_init_scripts_cb(struct modem_chat *chat,
         }
         else if (chat->script == &bg9x_ssl_configure_chat_script)
         {
+            handle_network_mode_command(data);
             handle_apn_command(data);
             next = &bg9x_ssl_register_chat_script;
         }
@@ -2067,10 +2215,8 @@ static void async_run_init_scripts_cb(struct modem_chat *chat,
     }
 }
 
-int run_init_scripts(struct bg9x_ssl_modem_data *data)
+static int run_init_scripts(struct bg9x_ssl_modem_data *data)
 {
-    handle_network_mode_command(data);
-
     // if there are any files to upload, upload them, otherwise run configure ssl chat script
     struct modem_chat_script *first_script = prepare_next_modem_file(data) == true
                                                  ? &bg9x_ssl_upload_file_chat_script
@@ -2080,13 +2226,13 @@ int run_init_scripts(struct bg9x_ssl_modem_data *data)
     return modem_chat_script_run(&data->chat, first_script);
 }
 
-void bg9x_ssl_connectivity_init(struct conn_mgr_conn_binding *if_conn)
+static void bg9x_ssl_connectivity_init(struct conn_mgr_conn_binding *if_conn)
 {
     LOG_INF("bg9x_ssl_connectivity_init");
     net_if_dormant_on(if_conn->iface);
 }
 
-int bg9x_ssl_connectivity_connect(struct conn_mgr_conn_binding *const if_conn)
+static int bg9x_ssl_connectivity_connect(struct conn_mgr_conn_binding *const if_conn)
 {
     int ret;
     struct bg9x_ssl_modem_data *data = net_if_get_device(if_conn->iface)->data;
@@ -2100,7 +2246,7 @@ int bg9x_ssl_connectivity_connect(struct conn_mgr_conn_binding *const if_conn)
     return ret;
 }
 
-int bg9x_ssl_connectivity_disconnect(struct conn_mgr_conn_binding *const if_conn)
+static int bg9x_ssl_connectivity_disconnect(struct conn_mgr_conn_binding *const if_conn)
 {
     struct bg9x_ssl_modem_data *data = net_if_get_device(if_conn->iface)->data;
 
@@ -2111,8 +2257,8 @@ int bg9x_ssl_connectivity_disconnect(struct conn_mgr_conn_binding *const if_conn
     return modem_chat_script_run(&data->chat, &bg9x_ssl_disconnect_chat_script);
 }
 
-int bg9x_ssl_connectivity_options_set(struct conn_mgr_conn_binding *const if_conn, int name,
-                                      const void *value, size_t length)
+static int bg9x_ssl_connectivity_options_set(struct conn_mgr_conn_binding *const if_conn, int name,
+                                             const void *value, size_t length)
 {
     struct bg9x_ssl_modem_data *data = net_if_get_device(if_conn->iface)->data;
     char *dest_str = NULL;
@@ -2162,8 +2308,8 @@ int bg9x_ssl_connectivity_options_set(struct conn_mgr_conn_binding *const if_con
     return 0;
 }
 
-int bg9x_ssl_connectivity_options_get(struct conn_mgr_conn_binding *const if_conn, int name, void *value,
-                                      size_t *length)
+static int bg9x_ssl_connectivity_options_get(struct conn_mgr_conn_binding *const if_conn, int name, void *value,
+                                             size_t *length)
 {
     struct bg9x_ssl_modem_data *data = net_if_get_device(if_conn->iface)->data;
     char *src_str = NULL;
@@ -2224,7 +2370,7 @@ static struct conn_mgr_conn_api conn_api = {
  * ========================================================================
  */
 
-int bg9x_ssl_modem_power_on(const struct device *dev)
+static int bg9x_ssl_modem_power_on(const struct device *dev)
 {
     // power pulse
     struct bg9x_ssl_modem_config *config = (struct bg9x_ssl_modem_config *)dev->config;
@@ -2257,7 +2403,7 @@ int bg9x_ssl_modem_power_on(const struct device *dev)
     return 0;
 }
 
-int bg9x_ssl_modem_power_off(const struct device *dev)
+static int bg9x_ssl_modem_power_off(const struct device *dev)
 {
     struct bg9x_ssl_modem_config *config = (struct bg9x_ssl_modem_config *)dev->config;
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)dev->data;
@@ -2320,6 +2466,7 @@ static int bg9x_ssl_init(const struct device *dev)
 
     // connectivity params
     data->network_mode = BG9X_SSL_CONNECTIVITY_NETWORK_MODE_AUTO;
+    memset(&data->connection_info, 0, sizeof(data->connection_info));
 
     memset(data->apn, 0, sizeof(data->apn));
     memset(data->username, 0, sizeof(data->username));

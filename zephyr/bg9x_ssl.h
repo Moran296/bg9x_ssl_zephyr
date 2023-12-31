@@ -2,6 +2,7 @@
 #define BG9X_SSL_H
 
 #include <zephyr/modem/chat.h>
+#include <zephyr/net/net_ip.h>
 
 #ifdef __cplusplus
 extern "C"
@@ -35,6 +36,38 @@ extern "C"
         BG9X_SSL_CONNECTIVITY_NETWORK_MODE_GSM_ONLY = 1,
         BG9X_SSL_CONNECTIVITY_NETWORK_MODE_LTE_ONLY = 3,
     };
+
+    enum cellular_network_type
+    {
+        CELLULAR_NETWORK_NONE,
+        CELLULAR_NETWORK_GSM,
+        CELLULAR_NETWORK_NBIOT,
+        CELLULAR_NETWORK_LTE_M,
+    };
+
+    struct modem_connection_info
+    {
+        enum cellular_network_type network_type;
+        struct in_addr ipv4addr;
+        char iccid[20];
+        char imei[16];
+        int rssi;
+        int rsrp;
+        int rsrq;
+        int sinr;
+    };
+
+    /*
+        @ brief:    get the modem connection info
+        @ param:    info - pointer to a modem_connection_info struct
+        @ return:   0 on success,
+                    -ENETDOWN if the modem is not connected to the network
+                    -ETIMEDOUT if the modem is connected to the network but the connection info is not available
+                    negative error code on failure
+
+        @ note:     this function is blocking and might take a minute or more so take care when calling it
+    */
+    int bg9x_ssl_get_connection_info(struct modem_connection_info *info);
 
     // functions for using the BG9x modem uart pipe for different purposes
 
