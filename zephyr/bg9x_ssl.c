@@ -1026,7 +1026,7 @@ int bg9x_ssl_get_connection_info(struct modem_connection_info *info)
     if (!info)
     {
         LOG_ERR("Invalid connection info pointer");
-        return;
+        return -EINVAL;
     }
 
     struct bg9x_ssl_modem_data *data = &modem_data;
