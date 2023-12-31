@@ -834,7 +834,7 @@ MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_configure_chat_script, bg9x_ssl_configure_chat
 static void imei_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
                           void *user_data)
 {
-    uint8_t i = 0;
+    int len = 0;
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
 
     if (argc != 2)
@@ -842,17 +842,14 @@ static void imei_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
         return;
     }
 
-    if (strlen(argv[1]) != 15)
+    len = strlen(argv[1]);
+    if (len != 15)
     {
+        LOG_WRN("Invalid IMEI length: %d", len);
         return;
     }
 
-    for (i = 0; i < 15; i++)
-    {
-        data->connection_info.imei[i] = argv[1][i] - '0';
-    }
-
-    data->connection_info.imei[i] = '\0';
+    strncpy(data->connection_info.imei, argv[1], 15);
 }
 
 static void cgpaddr_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
