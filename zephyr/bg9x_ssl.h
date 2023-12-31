@@ -49,7 +49,7 @@ extern "C"
     {
         enum cellular_network_type network_type;
         struct in_addr ipv4addr;
-        char iccid[20];
+        char iccid[24];
         char imei[16];
         int rssi;
         int rsrp;
