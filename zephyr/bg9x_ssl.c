@@ -35,6 +35,7 @@ LOG_MODULE_REGISTER(modem_quectel_bg9x_ssl, CONFIG_MODEM_LOG_LEVEL);
 
 #define QUECTEL_BUFFER_ACCESS_MODE 0
 #define QUECTEL_CME_ERR_FILE_DOES_NOT_EXIST "+CME ERROR: 405"
+#define QUECTEL_CME_ERR_FILE_DOES_NOT_EXIST_2 "+CME ERROR: 418"
 
 #define MODEM_RECEIVE_BUFFER_LEN 4096
 #define MODEM_TRANSMIT_BUFFER_LEN 1024
@@ -520,8 +521,9 @@ MODEM_CHAT_MATCHES_DEFINE(unsol_matches,
 
 MODEM_CHAT_MATCH_DEFINE(upload_finish_match, "+QFUPL: ", ",", upload_finish_match_cb);
 MODEM_CHAT_MATCH_DEFINE(file_not_exist, QUECTEL_CME_ERR_FILE_DOES_NOT_EXIST, "", NULL);
+MODEM_CHAT_MATCH_DEFINE(file_not_exist_2, QUECTEL_CME_ERR_FILE_DOES_NOT_EXIST_2, "", NULL);
 MODEM_CHAT_MATCH_DEFINE(upload_file_match, "CONNECT", "", transmit_file_ready_match_cb);
-MODEM_CHAT_MATCHES_DEFINE(delete_file_matches, ok_match, file_not_exist);
+MODEM_CHAT_MATCHES_DEFINE(delete_file_matches, ok_match, file_not_exist, file_not_exist_2);
 
 enum upload_files_dynamic_cmd
 {
@@ -855,6 +857,7 @@ static void imei_match_cb(struct modem_chat *chat, char **argv, uint16_t argc,
 static void cgpaddr_match_cb(struct modem_chat *chat, char **argv, uint16_t argc, void *user_data)
 {
     struct bg9x_ssl_modem_data *data = (struct bg9x_ssl_modem_data *)user_data;
+    char *ip_start = argv[2];
 
     if (argc != 3)
     {
@@ -862,8 +865,14 @@ static void cgpaddr_match_cb(struct modem_chat *chat, char **argv, uint16_t argc
         return;
     }
 
+    if (ip_start[0] == '"')
+        ip_start++;
+
+    if (ip_start[strlen(ip_start) - 1] == '"')
+        ip_start[strlen(ip_start) - 1] = '\0';
+
     LOG_DBG("IP address response: %s", argv[2]);
-    if (net_addr_pton(AF_INET, argv[2], &data->connection_info.ipv4addr) != 0)
+    if (net_addr_pton(AF_INET, ip_start, &data->connection_info.ipv4addr) != 0)
     {
         LOG_ERR("Invalid IP address");
         return;
@@ -937,9 +946,9 @@ MODEM_CHAT_SCRIPT_CMDS_DEFINE(bg9x_ssl_register_chat_script_cmds,
                               MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+QCCID", qccid_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
+                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QIACT=1", ok_match),
                               MODEM_CHAT_SCRIPT_CMD_RESP("AT+CGPADDR=1", cgpaddr_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match),
-                              MODEM_CHAT_SCRIPT_CMD_RESP("AT+QIACT=1", ok_match), );
+                              MODEM_CHAT_SCRIPT_CMD_RESP("", ok_match), );
 
 MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_register_chat_script, bg9x_ssl_register_chat_script_cmds,
                          abort_matches, script_cb_with_finish_notification, CONFIG_BG9X_SSL_MODEM_NETWORK_TIMEOUT_SEC);
