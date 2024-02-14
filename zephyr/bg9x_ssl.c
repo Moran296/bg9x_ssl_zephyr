@@ -2631,3 +2631,66 @@ void bg9x_control_detach_user_chat(void)
 
     k_mutex_unlock(&modem_data.modem_mutex);
 }
+
+static void bridge_recv_cb(struct modem_pipe *pipe, enum modem_pipe_event event,
+                           void *user_data)
+{
+    switch (event)
+    {
+    case MODEM_PIPE_EVENT_OPENED:
+        LOG_INF("bridge pipe opened");
+        break;
+    case MODEM_PIPE_EVENT_CLOSED:
+        LOG_INF("bridge pipe closed");
+        break;
+    case MODEM_PIPE_EVENT_RECEIVE_READY:
+        int ret = modem_pipe_receive(pipe,
+                                     modem_data.chat_receive_buf,
+                                     sizeof(modem_data.chat_receive_buf) - 1);
+
+        if (ret < 0)
+        {
+            LOG_ERR("bridge pipe failed to receive data: %d", ret);
+            break;
+        }
+
+        modem_data.chat_receive_buf[ret] = '\0';
+        if (user_data)
+        {
+            ((bridge_resp_cb)user_data)(modem_data.chat_receive_buf, ret);
+        }
+        else
+        {
+            LOG_WRN("no user data in bridge recv cb");
+        }
+
+        break;
+
+    default:
+        LOG_ERR("unexpected pipe event %d in bridge recv cb, event", event);
+    }
+}
+
+void bg9x_control_bridge_start(bridge_resp_cb cb)
+{
+    modem_chat_release(&modem_data.chat);
+    modem_pipe_attach(modem_data.uart_pipe, bridge_recv_cb, cb);
+}
+
+void bg9x_control_bridge_stop()
+{
+    modem_pipe_release(modem_data.uart_pipe);
+    modem_chat_attach(&modem_data.chat, modem_data.uart_pipe);
+}
+
+int bg9x_control_bridge_send(const char *cmd, size_t len)
+{
+    int ret = modem_pipe_transmit(modem_data.uart_pipe, cmd, len);
+    if (ret < 0)
+    {
+        LOG_ERR("Failed to transmit: %d", ret);
+        return ret;
+    }
+
+    return 0;
+}

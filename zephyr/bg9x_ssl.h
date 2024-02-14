@@ -90,6 +90,11 @@ extern "C"
     */
     void bg9x_control_detach_user_chat(void);
 
+    typedef void (*bridge_resp_cb)(const char *response, size_t len);
+    void bg9x_control_bridge_start(bridge_resp_cb);
+    void bg9x_control_bridge_stop();
+    int bg9x_control_bridge_send(const char *cmd, size_t len);
+
 #ifdef __cplusplus
 }
 #endif
