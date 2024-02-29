@@ -1360,6 +1360,7 @@ MODEM_CHAT_SCRIPT_DEFINE(bg9x_ssl_send_chat_script, bg9x_ssl_send_chat_script_cm
 
 static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t *buf, size_t len)
 {
+    static const int MAX_LEN_MSG_SUPPORTED = 1460;
     int transmitted = 0;
     int ret = 0;
 
@@ -1369,10 +1370,12 @@ static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t 
         return -ENOTCONN;
     }
 
-    LOG_INF("socket send with len %d requested", len);
+    int to_transmit = len > MAX_LEN_MSG_SUPPORTED ? MAX_LEN_MSG_SUPPORTED : len;
+
+    LOG_INF("socket send with len %d requested. sending %d", len, to_transmit);
 
     // transmit send request
-    snprintk(dynamic_cmd_buffers[0], DYNAMIC_CMD_BUFFER_LEN, "AT+QSSLSEND=1,%d", len);
+    snprintk(dynamic_cmd_buffers[0], DYNAMIC_CMD_BUFFER_LEN, "AT+QSSLSEND=1,%d", to_transmit);
     ret = modem_chat_script_run(&data->chat, &bg9x_ssl_send_chat_script);
     if (ret != 0)
     {
@@ -1383,16 +1386,24 @@ static int bg9x_ssl_socket_send(struct bg9x_ssl_modem_data *data, const uint8_t 
     LOG_DBG("sleeping for 150ms to allow modem to open prompt");
     k_sleep(K_MSEC(150));
 
-    // transmit data in chunks until len
-    transmitted = modem_transmit_data(data, buf, len);
-    if (transmitted < len)
-        LOG_WRN("Failed to transmit all data. transmitted: %d out of %d", transmitted, len);
+    // transmit data in chunks until to_transmit
+    transmitted = modem_transmit_data(data, buf, to_transmit);
+    if (transmitted < 0)
+    {
+        LOG_ERR("Failed to transmit data: %d", transmitted);
+        return transmitted;
+    }
+
+    if (transmitted < to_transmit)
+        LOG_WRN("Failed to transmit all data. transmitted: %d out of %d", transmitted, to_transmit);
 
     // wait for modem send result (SEND OK / SEND FAIL / ERROR)
     ret = wait_on_modem_event(data, MODEM_EVENT_SCRIPT, K_FOREVER);
     if (ret < SCRIPT_STATE_SUCCESS)
     {
         LOG_DBG("send script failed: %d", ret);
+        bg9x_ssl_fetch_error(data);
+        bg9x_ssl_update_socket_state(data);
         return ret;
     }
 
